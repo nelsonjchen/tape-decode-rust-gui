@@ -2,9 +2,10 @@
 
 `tape-decode-dist` is a localhost-first proof of concept for distributing bounded
 `tape-decode` jobs. A coordinator owns a versioned manifest and a persistent
-leased queue; heterogeneous runners pull one job at a time, cache the
-content-addressed FLAC input, launch a low-priority decoder child, and stream
-verified results back.
+leased queue; heterogeneous runners pull one job at a time, launch a
+low-priority decoder child, and stream verified results back. A runner can
+either cache the complete content-addressed FLAC or let the decoder read bounded
+byte ranges directly from the coordinator.
 
 Internal content identity uses BLAKE3. Input downloads are hashed as they stream
 to a `.partial` cache entry (including a resumed prefix), result uploads are
@@ -28,7 +29,12 @@ no authentication or TLS and is not intended for LAN exposure.
   transition and can be resumed after restart.
 - `runner` processes one lease at a time. `--decode-threads` is an administrator
   limit for that runner; decoder children use nice level 19 and macOS background
-  scheduling while the daemon retains normal priority.
+  scheduling while the daemon retains normal priority. The default
+  `--input-mode full-cache` preserves resumable, BLAKE3-verified LRU behavior.
+  `--input-mode http-range` skips that cache and gives the decoder a seekable
+  HTTP source backed by one bounded read-ahead window (8 MiB by default). The
+  latter validates the coordinator's BLAKE3 ETag and records every requested
+  range plus aggregate input bytes in each attempt directory.
 - `assemble` requires completed artifacts for every shard. It keeps the earlier
   shard authoritative until two consecutive overlap fields match by absolute
   `fileLoc`, parity, sync confidence, luma, and chroma. An unmatched seam is a

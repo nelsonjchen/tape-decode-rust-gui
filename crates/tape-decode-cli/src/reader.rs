@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 
@@ -168,8 +167,10 @@ pub trait SampleSource: Send {
 /// standard input, read forward-only (no real seek); anything else is a regular,
 /// seekable file. Raw formats stream bytes directly; `Flac` is decoded by
 /// [`crate::flac`].
-pub fn open_source(file: File, format: SampleFormat) -> Result<Box<dyn SampleSource>> {
-    let source: Box<dyn MediaSource> = Box::new(file);
+pub fn open_source(
+    source: Box<dyn MediaSource>,
+    format: SampleFormat,
+) -> Result<Box<dyn SampleSource>> {
     match format {
         SampleFormat::U8 => raw::<U8Sample>(source),
         SampleFormat::S8 => raw::<S8Sample>(source),

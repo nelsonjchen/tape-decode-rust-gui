@@ -8,9 +8,11 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+use symphonia_core::io::MediaSource;
 
 use crate::decode::{decode_all, decode_all_mt, MtParams};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
+use crate::http_source::{HttpRangeMetrics, HttpRangeSource};
 use crate::metadata::{PcmAudioParameters, TbcMetadataFull, VideoParameters};
 use crate::os;
 use crate::profiles::{flatten_profile, load_profile, load_profile_file, profile_names};
@@ -100,6 +102,7 @@ struct Cli {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Decode an RF capture.
     Decode(DecodeArgs),
@@ -122,6 +125,12 @@ enum Command {
         .args(["export_raw_tbc"])
         .conflicts_with("chroma_out"),
 ))]
+#[command(group(
+    ArgGroup::new("input_source")
+        .required(true)
+        .multiple(false)
+        .args(["infile", "input_url"]),
+))]
 struct DecodeArgs {
     /// Profile name.
     #[arg(long)]
@@ -141,6 +150,18 @@ struct DecodeArgs {
     /// Input format.
     #[arg(long, value_enum, ignore_case = true, default_value = "u8")]
     input_format: CliSampleFormat,
+    /// Seekable HTTP input served with byte-range support.
+    #[arg(long)]
+    input_url: Option<String>,
+    /// Expected HTTP ETag (normally the source BLAKE3 digest).
+    #[arg(long, requires = "input_url")]
+    input_http_etag: Option<String>,
+    /// Maximum HTTP read-ahead retained in memory.
+    #[arg(long, requires = "input_url", default_value_t = 8 * 1024 * 1024)]
+    input_http_buffer_bytes: usize,
+    /// Write HTTP range/byte metrics after the decode attempt.
+    #[arg(long, requires = "input_url")]
+    input_http_metrics_out: Option<PathBuf>,
     /// Allow overwriting outputs.
     #[arg(long)]
     overwrite: bool,
@@ -282,7 +303,7 @@ struct DecodeArgs {
     mt_trim_fraction: f64,
 
     /// Input RF capture file, or `-` to read from standard input.
-    infile: PathBuf,
+    infile: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -437,15 +458,27 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         }
     }
 
-    let input_file = if cli.infile.as_os_str() == "-" {
-        os::stdin_file()?
-    } else {
-        OpenOptions::new()
-            .read(true)
-            .open(&cli.infile)
-            .with_context(|| format!("failed to open input {}", cli.infile.display()))?
-    };
-
+    let (input_source, http_metrics): (Box<dyn MediaSource>, Option<Arc<HttpRangeMetrics>>) =
+        if let Some(url) = &cli.input_url {
+            let (source, metrics) = HttpRangeSource::open(
+                url.clone(),
+                cli.input_http_etag.clone(),
+                cli.input_http_buffer_bytes,
+            )
+            .with_context(|| format!("failed to open HTTP input {url}"))?;
+            (Box::new(source) as Box<dyn MediaSource>, Some(metrics))
+        } else {
+            let infile = cli.infile.as_ref().context("input path is required")?;
+            let file = if infile.as_os_str() == "-" {
+                os::stdin_file()?
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .open(infile)
+                    .with_context(|| format!("failed to open input {}", infile.display()))?
+            };
+            (Box::new(file) as Box<dyn MediaSource>, None)
+        };
     let mut open_options = OpenOptions::new();
     if cli.overwrite {
         open_options.write(true).create(true).truncate(true)
@@ -490,11 +523,11 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
     if cli.end_offset.is_some_and(|end| end <= start_offset) {
         bail!("--end-offset must be greater than --offset");
     }
-    let mut reader = DecodeReader::new(open_source(input_file, cli.input_format.into())?)
+    let mut reader = DecodeReader::new(open_source(input_source, cli.input_format.into())?)
         .with_end_offset(cli.end_offset);
     let mut writer = DecodeWriter::new(luma_out, chroma_out, metadata_out)?;
-    if cli.mt_threads == 0 {
-        decode_all(&mut reader, &mut writer, spec, start_offset)?;
+    let decode_result = if cli.mt_threads == 0 {
+        decode_all(&mut reader, &mut writer, spec, start_offset)
     } else {
         let mt = MtParams {
             threads: cli.mt_threads,
@@ -503,9 +536,21 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
             threshold: cli.mt_threshold,
             trim_fraction: cli.mt_trim_fraction,
         };
-        decode_all_mt(reader, &mut writer, spec, mt, start_offset)?;
+        decode_all_mt(reader, &mut writer, spec, mt, start_offset)
+    };
+    if let (Some(metrics), Some(path)) = (http_metrics, cli.input_http_metrics_out.as_ref()) {
+        let parent = path.parent().context("HTTP metrics path has no parent")?;
+        std::fs::create_dir_all(parent)?;
+        if path.exists() && !cli.overwrite {
+            bail!("refusing to overwrite HTTP metrics file {}", path.display());
+        }
+        let partial = path.with_extension("json.partial");
+        let mut json = serde_json::to_vec_pretty(&metrics.snapshot())?;
+        json.push(b'\n');
+        std::fs::write(&partial, json)?;
+        std::fs::rename(partial, path)?;
     }
-    Ok(())
+    decode_result
 }
 
 fn run_write_profile(args: WriteProfileArgs) -> Result<()> {

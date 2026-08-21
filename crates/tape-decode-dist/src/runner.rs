@@ -15,6 +15,7 @@ use crate::model::{
     ArtifactInfo, CompleteRequest, LeaseAction, LeaseGrant, LeaseRequest, LeaseResponse,
     RunnerRegistration, ARTIFACT_KINDS,
 };
+use crate::RunnerInputMode;
 
 fn cache_size(cache: &Path) -> Result<u64> {
     if !cache.exists() {
@@ -143,7 +144,22 @@ fn filetime_compat_touch(path: &Path, _now: SystemTime) -> Result<()> {
     Ok(())
 }
 
-fn child_command(grant: &LeaseGrant, input: &Path, attempt_dir: &Path, threads: usize) -> Command {
+enum DecoderInput<'a> {
+    File(&'a Path),
+    HttpRange {
+        url: String,
+        etag: &'a str,
+        buffer_bytes: usize,
+        metrics_path: &'a Path,
+    },
+}
+
+fn child_command(
+    grant: &LeaseGrant,
+    input: DecoderInput<'_>,
+    attempt_dir: &Path,
+    threads: usize,
+) -> Command {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("/usr/sbin/taskpolicy");
@@ -192,8 +208,24 @@ fn child_command(grant: &LeaseGrant, input: &Path, attempt_dir: &Path, threads: 
             "--mt-trim-fraction",
             &grant.decode.mt_trim_fraction.to_string(),
         ])
-        .args(&grant.decode.extra_args)
-        .arg(input);
+        .args(&grant.decode.extra_args);
+    match input {
+        DecoderInput::File(path) => {
+            command.arg(path);
+        }
+        DecoderInput::HttpRange {
+            url,
+            etag,
+            buffer_bytes,
+            metrics_path,
+        } => {
+            command
+                .args(["--input-url", &url])
+                .args(["--input-http-etag", etag])
+                .args(["--input-http-buffer-bytes", &buffer_bytes.to_string()])
+                .args(["--input-http-metrics-out", metrics_path.to_str().unwrap()]);
+        }
+    }
     command
 }
 
@@ -271,6 +303,8 @@ fn execute_lease(
     runner_root: &Path,
     threads: usize,
     cache_bytes: u64,
+    input_mode: RunnerInputMode,
+    http_range_buffer_bytes: usize,
     heartbeat_seconds: u64,
     grant: &LeaseGrant,
 ) -> Result<()> {
@@ -279,14 +313,9 @@ fn execute_lease(
         decoder_hash == grant.decode.decoder_blake3,
         "decoder binary does not match manifest hash"
     );
-    let cache_dir = runner_root.join("cache");
-    let (input, cache_hit) = ensure_input(client, coordinator, &cache_dir, grant, cache_bytes)?;
-    println!(
-        "runner {runner_id} leased {} attempt {} (cache {})",
-        grant.job.id,
-        grant.attempt,
-        if cache_hit { "hit" } else { "miss" }
-    );
+    if http_range_buffer_bytes == 0 {
+        bail!("HTTP range buffer must be positive");
+    }
     let attempt_parent = runner_root.join("attempts").join(&grant.job.id);
     fs::create_dir_all(&attempt_parent)?;
     let attempt_dir = attempt_parent.join(&grant.lease_id);
@@ -295,6 +324,35 @@ fn execute_lease(
         bail!("attempt path already exists for lease {}", grant.lease_id);
     }
     fs::create_dir(&partial_attempt)?;
+    let metrics_path = partial_attempt.join("input-http-metrics.json");
+    let cached_input;
+    let decoder_input = match input_mode {
+        RunnerInputMode::FullCache => {
+            let cache_dir = runner_root.join("cache");
+            let (input, cache_hit) =
+                ensure_input(client, coordinator, &cache_dir, grant, cache_bytes)?;
+            println!(
+                "runner {runner_id} leased {} attempt {} (cache {})",
+                grant.job.id,
+                grant.attempt,
+                if cache_hit { "hit" } else { "miss" }
+            );
+            cached_input = input;
+            DecoderInput::File(&cached_input)
+        }
+        RunnerInputMode::HttpRange => {
+            println!(
+                "runner {runner_id} leased {} attempt {} (HTTP range)",
+                grant.job.id, grant.attempt
+            );
+            DecoderInput::HttpRange {
+                url: format!("{coordinator}/v1/inputs/{}", grant.input.blake3),
+                etag: &grant.input.blake3,
+                buffer_bytes: http_range_buffer_bytes,
+                metrics_path: &metrics_path,
+            }
+        }
+    };
     let stdout = File::create(partial_attempt.join("decoder.stdout.log"))?;
     let stderr = File::create(partial_attempt.join("decoder.stderr.log"))?;
     let (stop_heartbeat, heartbeat) = heartbeat_thread(
@@ -304,7 +362,7 @@ fn execute_lease(
         grant.lease_id.clone(),
         Duration::from_secs(heartbeat_seconds),
     );
-    let status = child_command(grant, &input, &partial_attempt, threads)
+    let status = child_command(grant, decoder_input, &partial_attempt, threads)
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .status()
@@ -313,6 +371,13 @@ fn execute_lease(
     let _ = heartbeat.join();
     if !status.success() {
         bail!("decoder exited with {status}");
+    }
+    if metrics_path.exists() {
+        let metrics: serde_json::Value = serde_json::from_reader(File::open(&metrics_path)?)?;
+        println!(
+            "runner {runner_id} {} HTTP input: {} requests, {} bytes",
+            grant.job.id, metrics["requests"], metrics["bytesReceived"]
+        );
     }
     fs::rename(&partial_attempt, &attempt_dir)?;
     let paths = [
@@ -346,12 +411,15 @@ fn execute_lease(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     coordinator: String,
     runner_id: String,
     runner_root: PathBuf,
     threads: usize,
     cache_bytes: u64,
+    input_mode: RunnerInputMode,
+    http_range_buffer_bytes: usize,
     heartbeat_seconds: u64,
 ) -> Result<()> {
     if threads == 0 || heartbeat_seconds == 0 {
@@ -410,6 +478,8 @@ pub fn run(
             &runner_root,
             threads,
             cache_bytes,
+            input_mode,
+            http_range_buffer_bytes,
             heartbeat_seconds,
             &grant,
         ) {

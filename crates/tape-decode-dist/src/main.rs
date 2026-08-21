@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::hash::file_hashes;
 use crate::model::{
@@ -119,8 +119,20 @@ struct RunnerArgs {
     decode_threads: usize,
     #[arg(long, default_value_t = 16 * 1024 * 1024 * 1024)]
     cache_bytes: u64,
+    /// How the decoder obtains RF input for each leased job.
+    #[arg(long, value_enum, default_value_t = RunnerInputMode::FullCache)]
+    input_mode: RunnerInputMode,
+    /// Maximum read-ahead retained by the decoder in HTTP-range mode.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    http_range_buffer_bytes: usize,
     #[arg(long, default_value_t = 10)]
     heartbeat_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RunnerInputMode {
+    FullCache,
+    HttpRange,
 }
 
 #[derive(Args)]
@@ -261,6 +273,8 @@ fn main() -> Result<()> {
                 args.runner_root,
                 args.decode_threads,
                 args.cache_bytes,
+                args.input_mode,
+                args.http_range_buffer_bytes,
                 args.heartbeat_seconds,
             )
         }

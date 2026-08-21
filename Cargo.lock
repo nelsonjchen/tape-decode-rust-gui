@@ -1523,6 +1523,7 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "reqwest",
  "serde",
  "serde_json",
  "symphonia-bundle-flac",

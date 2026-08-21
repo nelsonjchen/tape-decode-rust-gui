@@ -2,6 +2,7 @@ mod cli;
 mod decode;
 mod fields_match;
 mod flac;
+mod http_source;
 mod metadata;
 mod os;
 mod profiles;
