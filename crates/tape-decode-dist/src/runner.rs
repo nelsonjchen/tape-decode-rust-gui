@@ -175,7 +175,16 @@ fn child_command(
         command
     };
     #[cfg(windows)]
-    let mut command = Command::new(&grant.decode.decoder_path);
+    let mut command = {
+        use std::os::windows::process::CommandExt;
+
+        // WinBase.h: IDLE_PRIORITY_CLASS. Keep decoder children out of the way
+        // of interactive work just as nice(19)/taskpolicy does on Unix/macOS.
+        const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
+        let mut command = Command::new(&grant.decode.decoder_path);
+        command.creation_flags(IDLE_PRIORITY_CLASS);
+        command
+    };
 
     let prefix = attempt_dir.join("output");
     command
