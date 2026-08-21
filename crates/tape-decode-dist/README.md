@@ -15,8 +15,9 @@ read of the multi-gigabyte happy path. The manifest also records SHA-256 for the
 original input and decoder in the same initial scan for preservation and
 interchange; SHA-256 is not used for runner cache keys or result identity.
 
-The coordinator deliberately refuses non-loopback bind addresses. This POC has
-no authentication or TLS and is not intended for LAN exposure.
+The coordinator refuses non-loopback bind addresses by default. `--allow-lan`
+is an explicit escape hatch for a trusted LAN; this POC still has no
+authentication or TLS, so it must not be exposed to an untrusted network.
 
 ## Commands
 

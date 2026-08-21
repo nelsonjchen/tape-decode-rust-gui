@@ -438,17 +438,23 @@ async fn status(State(app): State<AppState>) -> Json<CoordinatorState> {
     Json(app.state.lock().unwrap().clone())
 }
 
+fn validate_bind(bind: SocketAddr, allow_lan: bool) -> Result<()> {
+    let loopback = matches!(bind.ip(), IpAddr::V4(ip) if ip.is_loopback())
+        || matches!(bind.ip(), IpAddr::V6(ip) if ip.is_loopback());
+    if !loopback && !allow_lan {
+        bail!("POC coordinator refuses non-loopback bind address {bind} without --allow-lan");
+    }
+    Ok(())
+}
+
 pub async fn run(
     manifest_path: PathBuf,
     bind: SocketAddr,
+    allow_lan: bool,
     lease_seconds: u64,
     max_attempts: u32,
 ) -> Result<()> {
-    if !matches!(bind.ip(), IpAddr::V4(ip) if ip.is_loopback())
-        && !matches!(bind.ip(), IpAddr::V6(ip) if ip.is_loopback())
-    {
-        bail!("POC coordinator refuses non-loopback bind address {bind}");
-    }
+    validate_bind(bind, allow_lan)?;
     let manifest: RunManifest = read_json(&manifest_path)?;
     if manifest.schema_version != SCHEMA_VERSION {
         bail!("unsupported manifest schema {}", manifest.schema_version);
@@ -507,6 +513,15 @@ pub async fn run(
 mod tests {
     use super::*;
     use crate::model::{JobRecord, JobSpec};
+
+    #[test]
+    fn lan_bind_requires_explicit_opt_in() {
+        let lan = "10.168.1.16:8787".parse().unwrap();
+        let loopback = "127.0.0.1:8787".parse().unwrap();
+        assert!(validate_bind(loopback, false).is_ok());
+        assert!(validate_bind(lan, false).is_err());
+        assert!(validate_bind(lan, true).is_ok());
+    }
 
     fn leased(expires: u64, attempts: u32) -> CoordinatorState {
         CoordinatorState {

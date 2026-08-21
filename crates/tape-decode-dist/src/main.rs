@@ -33,7 +33,7 @@ struct Cli {
 enum Command {
     /// Create a versioned, content-addressed run manifest.
     Manifest(ManifestArgs),
-    /// Run the loopback-only leased-work coordinator.
+    /// Run the leased-work coordinator (loopback-only unless explicitly allowed).
     Coordinator(CoordinatorArgs),
     /// Run one pull-based decoder worker.
     Runner(RunnerArgs),
@@ -101,6 +101,9 @@ struct CoordinatorArgs {
     manifest: PathBuf,
     #[arg(long, default_value = "127.0.0.1:8787")]
     bind: SocketAddr,
+    /// Permit an unauthenticated coordinator bind outside loopback.
+    #[arg(long)]
+    allow_lan: bool,
     #[arg(long, default_value_t = 60)]
     lease_seconds: u64,
     #[arg(long, default_value_t = 3)]
@@ -261,6 +264,7 @@ fn main() -> Result<()> {
             tokio::runtime::Runtime::new()?.block_on(coordinator::run(
                 args.manifest,
                 args.bind,
+                args.allow_lan,
                 args.lease_seconds,
                 args.max_attempts,
             ))
