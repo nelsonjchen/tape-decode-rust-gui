@@ -2,6 +2,7 @@
 members = [
     "crates/tape-decode",
     "crates/tape-decode-cli",
+    "crates/tape-decode-dist",
 ]
 resolver = "2"
 

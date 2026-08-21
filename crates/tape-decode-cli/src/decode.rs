@@ -10,11 +10,9 @@ use tape_decode::{Decoder, DecoderMetadata, DecoderSpec, LumaOutput, WriteableFi
 use crate::reader::DecodeReader;
 use crate::writer::DecodeWriter;
 
-/// Decode the whole input serially. Like the multithreaded path, the input is
-/// streamed once from the stream start and the decoder skips past everything
-/// before `start_offset` itself (so this works on non-seekable inputs such as
-/// pipes); `start_offset` is taken directly rather than inferred from the
-/// reader's position.
+/// Decode the input serially from `start_offset`. Seekable inputs jump directly
+/// to the first sample the decoder needs; forward-only inputs discard up to the
+/// same point. Any exclusive end bound is enforced by [`DecodeReader`].
 pub fn decode_all(
     reader: &mut DecodeReader,
     writer: &mut DecodeWriter,
@@ -23,16 +21,16 @@ pub fn decode_all(
 ) -> Result<()> {
     let mut decoder = Decoder::new(Arc::clone(&spec), start_offset);
 
-    // Feed the decoder one chunk at a time over a sliding window starting at
-    // absolute sample `base` (0, since reading begins at the stream start). A
+    // Feed the decoder one chunk at a time over a sliding window. A
     // chunk exceeds one field's span, so each refill makes progress. `decode`
     // reports the offset before which input is no longer needed; we drop that
     // prefix, or seek forward past it when `start_offset` lands beyond the window.
     let chunk = spec.readlen() + 4 * BLOCKSIZE;
     let mut window: Vec<f32> = Vec::new();
     let mut read_buffer = vec![0.0f32; chunk];
-    let mut base: u64 = 0;
-    let mut read_pos: u64 = 0;
+    let mut base = first_needed_offset(&spec, start_offset)?;
+    reader.seek_samples(base)?;
+    let mut read_pos = reader.position();
 
     let mut fields_written = 0usize;
     loop {
@@ -199,11 +197,11 @@ struct BufState {
 }
 
 impl Tape {
-    fn new(source: DecodeReader) -> Self {
+    fn new(source: DecodeReader, start: u64) -> Self {
         Self {
             buf: RwLock::new(BufState {
                 buf: Vec::new(),
-                start: 0,
+                start,
                 eof: false,
                 len: None,
                 drop_threshold: 0,
@@ -780,17 +778,18 @@ impl<'a> MtOrchestrator<'a> {
 /// absolute sample where decoding begins (`--start-fileloc`, 0 by default).
 ///
 /// The input is streamed once through a shared [`Tape`]; the workers never
-/// reopen, seek, or stat it, so this runs on non-seekable inputs such as pipes.
-/// The decoders themselves skip past the input before `start_offset`, so
-/// reading still begins at the stream's start.
+/// reopen or stat it. Seekable inputs jump to the first needed sample, while a
+/// pipe reaches the same point by forward-only discard.
 pub fn decode_all_mt(
-    reader: DecodeReader,
+    mut reader: DecodeReader,
     writer: &mut DecodeWriter,
     spec: Arc<DecoderSpec>,
     mt: MtParams,
     start_offset: u64,
 ) -> Result<()> {
-    let tape = Arc::new(Tape::new(reader));
+    let initial_offset = first_needed_offset(&spec, start_offset)?;
+    reader.seek_samples(initial_offset)?;
+    let tape = Arc::new(Tape::new(reader, initial_offset));
     let spf = spec.samples_per_field();
     // A worker only needs to bank its own segment plus the handful of fields it
     // overlaps into the next segment to hand off (a one-field warm-up plus

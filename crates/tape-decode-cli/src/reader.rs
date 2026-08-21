@@ -3,8 +3,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::marker::PhantomData;
 
 use anyhow::{bail, Context as _, Result};
-use tracing::error;
 use symphonia_core::io::{MediaSource, MediaSourceStream, ReadBytes};
+use tracing::error;
 
 /// Input encoding. The raw formats widen straight to `f32` with no rescaling
 /// (so `S16LE` is little-endian `i16`, `F32LE` is passed through verbatim);
@@ -192,35 +192,124 @@ fn raw<F: SampleEncoding + 'static>(source: Box<dyn MediaSource>) -> Result<Box<
 pub struct DecodeReader {
     source: Box<dyn SampleSource>,
     eof: bool,
+    position: u64,
+    end_offset: Option<u64>,
 }
 
 impl DecodeReader {
     pub fn new(source: Box<dyn SampleSource>) -> Self {
-        Self { source, eof: false }
+        Self {
+            source,
+            eof: false,
+            position: 0,
+            end_offset: None,
+        }
+    }
+
+    /// Treat `end_offset` as an exclusive synthetic EOF in the decoded sample
+    /// stream. The bound is expressed in absolute input samples, just like
+    /// [`Self::seek_samples`].
+    pub fn with_end_offset(mut self, end_offset: Option<u64>) -> Self {
+        self.end_offset = end_offset;
+        self
     }
 
     pub fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         if self.eof {
             return Ok(0);
         }
-        match self.source.read(out) {
-            Ok(n) => Ok(n),
+        let permitted = match self.end_offset {
+            Some(end) => end.saturating_sub(self.position).min(out.len() as u64) as usize,
+            None => out.len(),
+        };
+        if permitted == 0 {
+            self.eof = true;
+            return Ok(0);
+        }
+        match self.source.read(&mut out[..permitted]) {
+            Ok(n) => {
+                self.position += n as u64;
+                if n < permitted || self.end_offset == Some(self.position) {
+                    self.eof = true;
+                }
+                Ok(n)
+            }
             Err(e) => {
                 error!("{e:#}");
                 self.eof = true;
-                Ok(0)
+                Err(e)
             }
         }
     }
 
     pub fn seek_samples(&mut self, sample: u64) -> Result<()> {
-        if self.eof {
-            return Ok(());
+        if self.end_offset.is_some_and(|end| sample > end) {
+            bail!(
+                "sample offset {sample} is past exclusive end offset {}",
+                self.end_offset.unwrap()
+            );
         }
-        if let Err(e) = self.source.seek_samples(sample) {
-            error!("{e:#}");
-            self.eof = true;
-        }
+        self.source.seek_samples(sample)?;
+        self.position = sample;
+        self.eof = self.end_offset == Some(sample);
         Ok(())
+    }
+
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct CountingSource {
+        samples: Vec<f32>,
+        position: usize,
+    }
+
+    impl SampleSource for CountingSource {
+        fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+            let available = self.samples.len().saturating_sub(self.position);
+            let count = available.min(out.len());
+            out[..count].copy_from_slice(&self.samples[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+
+        fn seek_samples(&mut self, sample: u64) -> Result<()> {
+            self.position = usize::try_from(sample)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn exclusive_end_offset_limits_reads_after_seek() {
+        let source = CountingSource {
+            samples: (0..100).map(|value| value as f32).collect(),
+            position: 0,
+        };
+        let mut reader = DecodeReader::new(Box::new(source)).with_end_offset(Some(37));
+        reader.seek_samples(20).unwrap();
+
+        let mut output = [0.0; 32];
+        assert_eq!(reader.read(&mut output).unwrap(), 17);
+        assert_eq!(
+            &output[..17],
+            &(20..37).map(|value| value as f32).collect::<Vec<_>>()
+        );
+        assert_eq!(reader.position(), 37);
+        assert_eq!(reader.read(&mut output).unwrap(), 0);
+    }
+
+    #[test]
+    fn seeking_past_end_is_rejected() {
+        let source = CountingSource {
+            samples: vec![0.0; 100],
+            position: 0,
+        };
+        let mut reader = DecodeReader::new(Box::new(source)).with_end_offset(Some(37));
+        assert!(reader.seek_samples(38).is_err());
     }
 }

@@ -135,6 +135,9 @@ struct DecodeArgs {
     /// Input sample offset to seek before decoding.
     #[arg(long)]
     offset: Option<u64>,
+    /// Exclusive input sample offset at which decoding stops.
+    #[arg(long)]
+    end_offset: Option<u64>,
     /// Input format.
     #[arg(long, value_enum, ignore_case = true, default_value = "u8")]
     input_format: CliSampleFormat,
@@ -483,11 +486,13 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
     };
 
     let spec = Arc::new(DecoderSpec::new(&request)?);
-    let mut reader = DecodeReader::new(open_source(input_file, cli.input_format.into())?);
-    let mut writer = DecodeWriter::new(luma_out, chroma_out, metadata_out)?;
     let start_offset = cli.offset.unwrap_or(0);
-    // Both paths stream the input once from the start (so they work on non-seekable
-    // inputs) and take `start_offset` directly.
+    if cli.end_offset.is_some_and(|end| end <= start_offset) {
+        bail!("--end-offset must be greater than --offset");
+    }
+    let mut reader = DecodeReader::new(open_source(input_file, cli.input_format.into())?)
+        .with_end_offset(cli.end_offset);
+    let mut writer = DecodeWriter::new(luma_out, chroma_out, metadata_out)?;
     if cli.mt_threads == 0 {
         decode_all(&mut reader, &mut writer, spec, start_offset)?;
     } else {
