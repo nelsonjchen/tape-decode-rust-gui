@@ -156,6 +156,7 @@ enum DecoderInput<'a> {
 
 fn child_command(
     grant: &LeaseGrant,
+    decoder_path: &Path,
     input: DecoderInput<'_>,
     attempt_dir: &Path,
     threads: usize,
@@ -164,14 +165,14 @@ fn child_command(
     let mut command = {
         let mut command = Command::new("/usr/sbin/taskpolicy");
         command.args(["-b", "/usr/bin/nice", "-n", "19"]);
-        command.arg(&grant.decode.decoder_path);
+        command.arg(decoder_path);
         command
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut command = {
         let mut command = Command::new("/usr/bin/nice");
         command.args(["-n", "19"]);
-        command.arg(&grant.decode.decoder_path);
+        command.arg(decoder_path);
         command
     };
     #[cfg(windows)]
@@ -181,7 +182,7 @@ fn child_command(
         // WinBase.h: IDLE_PRIORITY_CLASS. Keep decoder children out of the way
         // of interactive work just as nice(19)/taskpolicy does on Unix/macOS.
         const IDLE_PRIORITY_CLASS: u32 = 0x0000_0040;
-        let mut command = Command::new(&grant.decode.decoder_path);
+        let mut command = Command::new(decoder_path);
         command.creation_flags(IDLE_PRIORITY_CLASS);
         command
     };
@@ -311,17 +312,26 @@ fn execute_lease(
     runner_id: &str,
     runner_root: &Path,
     threads: usize,
+    decoder_override: Option<&Path>,
+    allow_platform_decoder: bool,
     cache_bytes: u64,
     input_mode: RunnerInputMode,
     http_range_buffer_bytes: usize,
     heartbeat_seconds: u64,
     grant: &LeaseGrant,
 ) -> Result<()> {
-    let (decoder_hash, _) = blake3_file(&grant.decode.decoder_path)?;
-    anyhow::ensure!(
-        decoder_hash == grant.decode.decoder_blake3,
-        "decoder binary does not match manifest hash"
-    );
+    let decoder_path = decoder_override.unwrap_or(&grant.decode.decoder_path);
+    let (decoder_hash, _) = blake3_file(decoder_path)?;
+    if decoder_hash != grant.decode.decoder_blake3 {
+        anyhow::ensure!(
+            decoder_override.is_some() && allow_platform_decoder,
+            "decoder binary does not match manifest hash; a native platform build requires --decoder and --allow-platform-decoder"
+        );
+        println!(
+            "runner {runner_id} using native platform decoder {} ({decoder_hash})",
+            decoder_path.display()
+        );
+    }
     if http_range_buffer_bytes == 0 {
         bail!("HTTP range buffer must be positive");
     }
@@ -371,11 +381,17 @@ fn execute_lease(
         grant.lease_id.clone(),
         Duration::from_secs(heartbeat_seconds),
     );
-    let status = child_command(grant, decoder_input, &partial_attempt, threads)
-        .stdout(Stdio::from(stdout))
-        .stderr(Stdio::from(stderr))
-        .status()
-        .context("failed to launch decoder child")?;
+    let status = child_command(
+        grant,
+        decoder_path,
+        decoder_input,
+        &partial_attempt,
+        threads,
+    )
+    .stdout(Stdio::from(stdout))
+    .stderr(Stdio::from(stderr))
+    .status()
+    .context("failed to launch decoder child")?;
     let _ = stop_heartbeat.send(());
     let _ = heartbeat.join();
     if !status.success() {
@@ -426,6 +442,8 @@ pub fn run(
     runner_id: String,
     runner_root: PathBuf,
     threads: usize,
+    decoder_override: Option<PathBuf>,
+    allow_platform_decoder: bool,
     cache_bytes: u64,
     input_mode: RunnerInputMode,
     http_range_buffer_bytes: usize,
@@ -434,6 +452,14 @@ pub fn run(
     if threads == 0 || heartbeat_seconds == 0 {
         bail!("threads and heartbeat interval must be positive");
     }
+    if allow_platform_decoder && decoder_override.is_none() {
+        bail!("--allow-platform-decoder requires --decoder");
+    }
+    let decoder_blake3 = decoder_override
+        .as_deref()
+        .map(blake3_file)
+        .transpose()?
+        .map(|(hash, _)| hash);
     #[cfg(unix)]
     {
         // Give the daemon and every decoder child one private process group so
@@ -457,6 +483,7 @@ pub fn run(
             runner_id: runner_id.clone(),
             decode_threads: threads,
             platform: std::env::consts::OS.to_string(),
+            decoder_blake3,
         })
         .send()?
         .error_for_status()?;
@@ -486,6 +513,8 @@ pub fn run(
             &runner_id,
             &runner_root,
             threads,
+            decoder_override.as_deref(),
+            allow_platform_decoder,
             cache_bytes,
             input_mode,
             http_range_buffer_bytes,

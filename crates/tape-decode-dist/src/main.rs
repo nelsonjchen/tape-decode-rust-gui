@@ -120,6 +120,12 @@ struct RunnerArgs {
     runner_root: PathBuf,
     #[arg(long)]
     decode_threads: usize,
+    /// Runner-local decoder binary (needed when manifest paths are not shared).
+    #[arg(long)]
+    decoder: Option<PathBuf>,
+    /// Accept a runner-local platform build whose binary hash differs from the manifest build.
+    #[arg(long, requires = "decoder")]
+    allow_platform_decoder: bool,
     #[arg(long, default_value_t = 16 * 1024 * 1024 * 1024)]
     cache_bytes: u64,
     /// How the decoder obtains RF input for each leased job.
@@ -276,6 +282,8 @@ fn main() -> Result<()> {
                 args.runner_id,
                 args.runner_root,
                 args.decode_threads,
+                args.decoder,
+                args.allow_platform_decoder,
                 args.cache_bytes,
                 args.input_mode,
                 args.http_range_buffer_bytes,

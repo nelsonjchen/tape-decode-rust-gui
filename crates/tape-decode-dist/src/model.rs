@@ -151,6 +151,7 @@ pub struct RunnerRegistration {
     pub runner_id: String,
     pub decode_threads: usize,
     pub platform: String,
+    pub decoder_blake3: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

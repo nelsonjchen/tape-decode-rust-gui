@@ -36,6 +36,10 @@ authentication or TLS, so it must not be exposed to an untrusted network.
   HTTP source backed by one bounded read-ahead window (8 MiB by default). The
   latter validates the coordinator's BLAKE3 ETag and records every requested
   range plus aggregate input bytes in each attempt directory.
+  Heterogeneous hosts can supply a native binary with `--decoder`; if its hash
+  necessarily differs from the manifest's platform build,
+  `--allow-platform-decoder` is also required. Each runner registers its actual
+  local decoder BLAKE3 for audit evidence.
 - `assemble` requires completed artifacts for every shard. It keeps the earlier
   shard authoritative until two consecutive overlap fields match by absolute
   `fileLoc`, parity, sync confidence, luma, and chroma. An unmatched seam is a
