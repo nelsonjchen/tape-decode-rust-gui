@@ -25,8 +25,10 @@ fn demod_burst(
         q += sample * sin;
     }
 
-    let burst_magnitude = i.hypot(q);
-    let burst_phase_deg = q.atan2(i).to_degrees().rem_euclid(360.0);
+    // These values steer phase/track decisions, so use the force-software
+    // implementation instead of platform libm.
+    let burst_magnitude = libm::hypotf(i, q);
+    let burst_phase_deg = libm::atan2f(q, i).to_degrees().rem_euclid(360.0);
     Ok((burst_phase_deg, burst_magnitude, i, q))
 }
 
@@ -673,7 +675,11 @@ fn get_phase_rotation_sequence(
                 q_total += q_value / magnitude;
             }
         }
-        Some(q_total.atan2(i_total).to_degrees().rem_euclid(360.0))
+        Some(
+            libm::atan2f(q_total, i_total)
+                .to_degrees()
+                .rem_euclid(360.0),
+        )
     } else {
         None
     };

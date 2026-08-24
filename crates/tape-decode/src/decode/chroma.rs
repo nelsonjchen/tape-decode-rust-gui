@@ -9,7 +9,10 @@ fn adjust_phase(
     assert_eq!(input_data.len(), output_data.len());
 
     let phase_adjustment = (target_phase - input_phase).to_radians();
-    let (rotation_im, rotation_re) = phase_adjustment.sin_cos();
+    // Keep NTSC phase rotation bitwise stable across architectures. Platform
+    // `f32::sin_cos` implementations can round differently by one ULP, which
+    // becomes a one-count difference when chroma is encoded to `u16`.
+    let (rotation_im, rotation_re) = libm::sincosf(phase_adjustment);
 
     for (input, output) in input_data.iter().zip(output_data.iter_mut()) {
         *output = input.re.mul_add(rotation_re, -(input.im * rotation_im));

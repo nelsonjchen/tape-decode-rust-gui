@@ -1,5 +1,6 @@
 mod cli;
 mod decode;
+mod exact_verify;
 mod fields_match;
 mod flac;
 mod http_source;

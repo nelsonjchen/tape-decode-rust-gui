@@ -1,9 +1,9 @@
 //! Command-line front end: argument parsing, profile lookup, and wiring the
 //! parsed options into a `DecoderSpec` before running the decode.
 
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context as _, Result};
@@ -112,6 +112,8 @@ enum Command {
     ListProfiles(ListProfilesArgs),
     /// Compare two decode outputs.
     Compare(CompareArgs),
+    /// Require exact raster bytes and metadata values from two decode outputs.
+    VerifyExact(VerifyExactArgs),
 }
 
 #[derive(Args, Debug)]
@@ -182,6 +184,13 @@ struct DecodeArgs {
     /// Metadata output path
     #[arg(long)]
     metadata_out: Option<PathBuf>,
+
+    /// Load a versioned, bit-exact numeric plan before decoding.
+    #[arg(long, value_name = "FILE")]
+    load_numeric_plan: Option<PathBuf>,
+    /// Emit the resolved bit-exact numeric plan before decoding.
+    #[arg(long, value_name = "FILE")]
+    emit_numeric_plan: Option<PathBuf>,
 
     /// Apply a chroma trap to the luma path.
     #[arg(long)]
@@ -354,6 +363,34 @@ struct CompareArgs {
     float_rel_tol: f64,
 }
 
+#[derive(Args, Debug)]
+struct VerifyExactArgs {
+    /// Reference and candidate metadata sidecars (`.tbc.json`).
+    #[arg(
+        long,
+        required = true,
+        num_args = 2,
+        value_names = ["REFERENCE", "CANDIDATE"]
+    )]
+    metadata: Vec<PathBuf>,
+    /// Reference and candidate luma `.tbc` files.
+    #[arg(
+        long,
+        required = true,
+        num_args = 2,
+        value_names = ["REFERENCE", "CANDIDATE"]
+    )]
+    luma: Vec<PathBuf>,
+    /// Reference and candidate chroma `_chroma.tbc` files.
+    #[arg(
+        long,
+        required = true,
+        num_args = 2,
+        value_names = ["REFERENCE", "CANDIDATE"]
+    )]
+    chroma: Vec<PathBuf>,
+}
+
 fn parse_frequency(value: &str) -> Result<f64> {
     let value = value.trim();
     let suffix_start = value
@@ -376,6 +413,306 @@ pub fn run_cli() -> Result<()> {
         Command::WriteProfile(args) => run_write_profile(args),
         Command::ListProfiles(args) => run_list_profiles(args),
         Command::Compare(args) => run_compare(args),
+        Command::VerifyExact(args) => run_verify_exact(args),
+    }
+}
+
+fn run_verify_exact(args: VerifyExactArgs) -> Result<()> {
+    let metadata = <[PathBuf; 2]>::try_from(args.metadata).map_err(|_| {
+        anyhow::anyhow!("--metadata requires exactly REFERENCE and CANDIDATE paths")
+    })?;
+    let luma = <[PathBuf; 2]>::try_from(args.luma)
+        .map_err(|_| anyhow::anyhow!("--luma requires exactly REFERENCE and CANDIDATE paths"))?;
+    let chroma = <[PathBuf; 2]>::try_from(args.chroma)
+        .map_err(|_| anyhow::anyhow!("--chroma requires exactly REFERENCE and CANDIDATE paths"))?;
+
+    crate::exact_verify::run(metadata, luma, chroma)
+}
+
+#[derive(Debug)]
+struct FileRole {
+    name: &'static str,
+    path: PathBuf,
+    is_output: bool,
+}
+
+#[derive(Debug)]
+struct InspectedFileRole {
+    role: FileRole,
+    identity_path: PathBuf,
+    #[cfg(unix)]
+    unix_identity: Option<(u64, u64)>,
+}
+
+fn validate_decode_file_roles(cli: &DecodeArgs) -> Result<()> {
+    let mut roles = Vec::new();
+
+    if let Some(path) = cli.infile.as_deref().filter(|path| path.as_os_str() != "-") {
+        roles.push(FileRole {
+            name: "local input",
+            path: path.to_path_buf(),
+            is_output: false,
+        });
+    }
+    if let Some(path) = cli.profile_file.as_deref() {
+        roles.push(FileRole {
+            name: "profile input",
+            path: path.to_path_buf(),
+            is_output: false,
+        });
+    }
+    if let Some(path) = cli.load_numeric_plan.as_deref() {
+        roles.push(FileRole {
+            name: "loaded numeric plan",
+            path: path.to_path_buf(),
+            is_output: false,
+        });
+    }
+
+    if cli.luma_out.as_os_str() != "-" {
+        roles.push(FileRole {
+            name: "luma output",
+            path: cli.luma_out.clone(),
+            is_output: true,
+        });
+    }
+    if let Some(path) = cli
+        .chroma_out
+        .as_deref()
+        .filter(|path| path.as_os_str() != "-")
+    {
+        roles.push(FileRole {
+            name: "chroma output",
+            path: path.to_path_buf(),
+            is_output: true,
+        });
+    }
+    if let Some(path) = cli
+        .metadata_out
+        .as_deref()
+        .filter(|path| path.as_os_str() != "-")
+    {
+        roles.push(FileRole {
+            name: "metadata output",
+            path: path.to_path_buf(),
+            is_output: true,
+        });
+    }
+    if let Some(path) = cli.emit_numeric_plan.as_deref() {
+        roles.push(FileRole {
+            name: "emitted numeric plan",
+            path: path.to_path_buf(),
+            is_output: true,
+        });
+    }
+    if let Some(path) = cli.input_http_metrics_out.as_deref() {
+        roles.push(FileRole {
+            name: "HTTP metrics output",
+            path: path.to_path_buf(),
+            is_output: true,
+        });
+        roles.push(FileRole {
+            name: "HTTP metrics temporary output",
+            path: path.with_extension("json.partial"),
+            is_output: true,
+        });
+    }
+
+    validate_file_roles(roles)
+}
+
+fn validate_file_roles(roles: Vec<FileRole>) -> Result<()> {
+    let inspected = roles
+        .into_iter()
+        .map(inspect_file_role)
+        .collect::<Result<Vec<_>>>()?;
+
+    for (index, left) in inspected.iter().enumerate() {
+        for right in &inspected[index + 1..] {
+            // Read-only roles do not risk truncating one another, and retaining
+            // that behavior avoids changing otherwise valid invocations.
+            if !left.role.is_output && !right.role.is_output {
+                continue;
+            }
+            if file_roles_alias(left, right) {
+                bail!(
+                    "unsafe file-role alias: {} ({}) and {} ({}) refer to the same file",
+                    left.role.name,
+                    left.role.path.display(),
+                    right.role.name,
+                    right.role.path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_file_role(role: FileRole) -> Result<InspectedFileRole> {
+    let identity_path = resolve_path_for_identity(&role.path).with_context(|| {
+        format!(
+            "failed to inspect {} path {}",
+            role.name,
+            role.path.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    let unix_identity = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        match fs::metadata(&role.path) {
+            Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect {} path {}",
+                        role.name,
+                        role.path.display()
+                    )
+                });
+            }
+        }
+    };
+
+    Ok(InspectedFileRole {
+        role,
+        identity_path,
+        #[cfg(unix)]
+        unix_identity,
+    })
+}
+
+fn file_roles_alias(left: &InspectedFileRole, right: &InspectedFileRole) -> bool {
+    if left.identity_path == right.identity_path {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if left.unix_identity.is_some() && left.unix_identity == right.unix_identity {
+        return true;
+    }
+
+    false
+}
+
+/// Resolve all observable symlinks and canonicalize the longest existing
+/// prefix. This compares not-yet-created outputs correctly when their parents
+/// are reached through different symlink spellings, and also resolves dangling
+/// final symlinks without following an unbounded chain.
+fn resolve_path_for_identity(path: &Path) -> Result<PathBuf> {
+    const MAX_SYMLINKS: usize = 40;
+
+    let mut candidate = absolute_path(path)?;
+    let mut followed_symlinks = 0;
+    loop {
+        if let Some(resolved) = replace_first_symlink(&candidate)? {
+            followed_symlinks += 1;
+            if followed_symlinks > MAX_SYMLINKS {
+                bail!("too many symbolic links while resolving {}", path.display());
+            }
+            candidate = absolute_path(&resolved)?;
+            continue;
+        }
+
+        let normalized = normalize_identity_path(&candidate);
+        if normalized != candidate {
+            // A missing component can prevent the first scan from observing a
+            // symlink after `..`. Normalize once, then scan the reachable path
+            // again before falling back to its longest existing prefix.
+            candidate = normalized;
+            continue;
+        }
+        return canonicalize_existing_prefix(&candidate);
+    }
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()
+            .context("failed to determine current directory")?
+            .join(path))
+    }
+}
+
+fn normalize_identity_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Identity paths are absolute. Only pop a normal component so
+                // `..` can never remove the platform prefix or root directory.
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                }
+            }
+        }
+    }
+    normalized
+}
+
+fn replace_first_symlink(path: &Path) -> Result<Option<PathBuf>> {
+    let mut components = path.components();
+    let mut current = PathBuf::new();
+    while let Some(component) = components.next() {
+        current.push(component.as_os_str());
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect path {}", current.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&current)
+                .with_context(|| format!("failed to read symbolic link {}", current.display()))?;
+            let mut replacement = if target.is_absolute() {
+                target
+            } else {
+                current
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(target)
+            };
+            replacement.push(components.as_path());
+            return Ok(Some(replacement));
+        }
+    }
+    Ok(None)
+}
+
+fn canonicalize_existing_prefix(path: &Path) -> Result<PathBuf> {
+    let mut prefix = path.to_path_buf();
+    let mut suffix = Vec::new();
+    loop {
+        match fs::canonicalize(&prefix) {
+            Ok(mut canonical) => {
+                for component in suffix.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(normalize_identity_path(&canonical));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = prefix
+                    .file_name()
+                    .map(ToOwned::to_owned)
+                    .with_context(|| format!("failed to resolve path {}", path.display()))?;
+                suffix.push(component);
+                prefix.pop();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to resolve path {}", path.display()));
+            }
+        }
     }
 }
 
@@ -387,6 +724,19 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .try_init();
+
+    validate_decode_file_roles(&cli)?;
+    if cli
+        .metadata_out
+        .as_deref()
+        .is_some_and(|path| path.as_os_str() == "-")
+    {
+        bail!("metadata output cannot be standard output");
+    }
+    let start_offset = cli.offset.unwrap_or(0);
+    if cli.end_offset.is_some_and(|end| end <= start_offset) {
+        bail!("--end-offset must be greater than --offset");
+    }
 
     let profile = match (cli.profile.as_deref(), cli.profile_file.as_deref()) {
         (Some(name), None) => load_profile(name)?,
@@ -458,6 +808,18 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         }
     }
 
+    let spec = if let Some(path) = cli.load_numeric_plan.as_deref() {
+        let (spec, identity) = DecoderSpec::new_with_canonical_numeric_plan(&request, path)?;
+        tracing::info!(
+            numeric_plan_id = %identity,
+            path = %path.display(),
+            "loaded canonical numeric plan"
+        );
+        spec
+    } else {
+        DecoderSpec::new(&request)?
+    };
+
     let (input_source, http_metrics): (Box<dyn MediaSource>, Option<Arc<HttpRangeMetrics>>) =
         if let Some(url) = &cli.input_url {
             let (source, metrics) = HttpRangeSource::open(
@@ -479,6 +841,16 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
             };
             (Box::new(file) as Box<dyn MediaSource>, None)
         };
+    if let Some(path) = cli.emit_numeric_plan.as_deref() {
+        let identity = spec.write_canonical_numeric_plan(&request, path, cli.overwrite)?;
+        tracing::info!(
+            numeric_plan_id = %identity,
+            path = %path.display(),
+            "emitted canonical numeric plan"
+        );
+    }
+    let spec = Arc::new(spec);
+
     let mut open_options = OpenOptions::new();
     if cli.overwrite {
         open_options.write(true).create(true).truncate(true)
@@ -508,21 +880,13 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         _ => None,
     };
 
-    let metadata_out = match cli.metadata_out {
-        Some(path) if path.as_os_str() != "-" => {
-            Some(open_options.clone().open(&path).with_context(|| {
+    let metadata_out =
+        match cli.metadata_out {
+            Some(path) => Some(open_options.clone().open(&path).with_context(|| {
                 format!("failed to open metadata output file {}", path.display())
-            })?)
-        }
-        Some(_) => bail!("metadata output cannot be standard output"),
-        _ => None,
-    };
-
-    let spec = Arc::new(DecoderSpec::new(&request)?);
-    let start_offset = cli.offset.unwrap_or(0);
-    if cli.end_offset.is_some_and(|end| end <= start_offset) {
-        bail!("--end-offset must be greater than --offset");
-    }
+            })?),
+            _ => None,
+        };
     let mut reader = DecodeReader::new(open_source(input_source, cli.input_format.into())?)
         .with_end_offset(cli.end_offset);
     let mut writer = DecodeWriter::new(luma_out, chroma_out, metadata_out)?;
@@ -1064,5 +1428,254 @@ fn report_json(candidate: &Path, total_errors: usize, errors: &[String], failed:
             eprintln!("  {error}");
         }
         *failed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    static NEXT_TEMP_DIR: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(label: &str) -> Self {
+            let unique = NEXT_TEMP_DIR.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is before the Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "tape-decode-cli-{label}-{}-{nanos}-{unique}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("failed to create test directory");
+            Self(path)
+        }
+
+        fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.0.join(path)
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn role(name: &'static str, path: PathBuf, is_output: bool) -> FileRole {
+        FileRole {
+            name,
+            path,
+            is_output,
+        }
+    }
+
+    fn parse_decode_args(args: Vec<OsString>) -> DecodeArgs {
+        match Cli::try_parse_from(args)
+            .expect("decode arguments should parse")
+            .command
+        {
+            Command::Decode(args) => args,
+            _ => panic!("expected decode command"),
+        }
+    }
+
+    #[test]
+    fn rejects_same_spelling_for_input_and_output() {
+        let temp = TestDir::new("same-path");
+        let path = temp.join("capture.bin");
+        let original_input = b"input must survive";
+        fs::write(&path, original_input).unwrap();
+
+        let cli = parse_decode_args(vec![
+            OsString::from("tape-decode"),
+            OsString::from("decode"),
+            OsString::from("--profile"),
+            OsString::from("NTSC_VHS"),
+            OsString::from("--luma-out"),
+            path.clone().into_os_string(),
+            OsString::from("--overwrite"),
+            path.clone().into_os_string(),
+        ]);
+        let error = run_decode(cli).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("local input"));
+        assert!(message.contains("luma output"));
+        assert_eq!(fs::read(path).unwrap(), original_input);
+    }
+
+    #[test]
+    fn rejects_lexically_equivalent_nonexistent_outputs() {
+        let temp = TestDir::new("lexical-path");
+        let direct = temp.join("video.tbc");
+        let alternate = temp.join("not-created").join("..").join("video.tbc");
+
+        let error = validate_file_roles(vec![
+            role("luma output", direct, true),
+            role("chroma output", alternate, true),
+        ])
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unsafe file-role alias"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_identity_for_input_and_output() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("symlink");
+        let input = temp.join("capture.bin");
+        let output = temp.join("output-link");
+        fs::write(&input, b"input").unwrap();
+        symlink(&input, &output).unwrap();
+
+        assert!(validate_file_roles(vec![
+            role("local input", input, false),
+            role("luma output", output, true),
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_dangling_symlink_to_nonexistent_output() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("dangling-symlink");
+        let target = temp.join("not-created.tbc");
+        let alias = temp.join("output-link");
+        symlink(&target, &alias).unwrap();
+
+        assert!(validate_file_roles(vec![
+            role("luma output", target, true),
+            role("chroma output", alias, true),
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_hard_link_identity_for_input_and_output() {
+        let temp = TestDir::new("hard-link");
+        let input = temp.join("capture.bin");
+        let output = temp.join("output-hard-link");
+        fs::write(&input, b"input").unwrap();
+        fs::hard_link(&input, &output).unwrap();
+
+        assert!(validate_file_roles(vec![
+            role("local input", input, false),
+            role("luma output", output, true),
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_nonexistent_outputs_below_symlinked_parent() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TestDir::new("symlink-parent");
+        let real_parent = temp.join("real");
+        let alias_parent = temp.join("alias");
+        fs::create_dir(&real_parent).unwrap();
+        symlink(&real_parent, &alias_parent).unwrap();
+
+        assert!(validate_file_roles(vec![
+            role("luma output", real_parent.join("video.tbc"), true),
+            role("chroma output", alias_parent.join("video.tbc"), true),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn decode_roles_include_http_metrics_temporary_output() {
+        let temp = TestDir::new("metrics-partial");
+        let metrics = temp.join("metrics.json");
+        let luma = metrics.with_extension("json.partial");
+        let cli = parse_decode_args(vec![
+            OsString::from("tape-decode"),
+            OsString::from("decode"),
+            OsString::from("--profile"),
+            OsString::from("NTSC_VHS"),
+            OsString::from("--input-url"),
+            OsString::from("https://example.invalid/capture.bin"),
+            OsString::from("--input-http-metrics-out"),
+            metrics.into_os_string(),
+            OsString::from("--luma-out"),
+            luma.into_os_string(),
+        ]);
+
+        let error = validate_decode_file_roles(&cli).unwrap_err().to_string();
+        assert!(error.contains("luma output"));
+        assert!(error.contains("HTTP metrics temporary output"));
+    }
+
+    #[test]
+    fn invalid_numeric_plan_does_not_truncate_existing_output() {
+        let temp = TestDir::new("invalid-plan");
+        let input = temp.join("capture.bin");
+        let plan = temp.join("invalid.plan");
+        let luma = temp.join("video.tbc");
+        let original_output = b"existing output must survive";
+        fs::write(&input, b"input").unwrap();
+        fs::write(&plan, b"not a numeric plan").unwrap();
+        fs::write(&luma, original_output).unwrap();
+
+        let cli = parse_decode_args(vec![
+            OsString::from("tape-decode"),
+            OsString::from("decode"),
+            OsString::from("--profile"),
+            OsString::from("NTSC_VHS"),
+            OsString::from("--cafc=false"),
+            OsString::from("--load-numeric-plan"),
+            plan.into_os_string(),
+            OsString::from("--luma-out"),
+            luma.clone().into_os_string(),
+            OsString::from("--overwrite"),
+            input.into_os_string(),
+        ]);
+
+        let error = run_decode(cli).unwrap_err().to_string();
+        assert!(error.contains("numeric plan"), "unexpected error: {error}");
+        assert_eq!(fs::read(luma).unwrap(), original_output);
+    }
+
+    #[test]
+    fn invalid_offset_does_not_truncate_existing_output() {
+        let temp = TestDir::new("invalid-offset");
+        let input = temp.join("capture.bin");
+        let luma = temp.join("video.tbc");
+        let original_output = b"existing output must survive";
+        fs::write(&input, b"input").unwrap();
+        fs::write(&luma, original_output).unwrap();
+
+        let cli = parse_decode_args(vec![
+            OsString::from("tape-decode"),
+            OsString::from("decode"),
+            OsString::from("--profile"),
+            OsString::from("NTSC_VHS"),
+            OsString::from("--offset"),
+            OsString::from("10"),
+            OsString::from("--end-offset"),
+            OsString::from("10"),
+            OsString::from("--luma-out"),
+            luma.clone().into_os_string(),
+            OsString::from("--overwrite"),
+            input.into_os_string(),
+        ]);
+
+        let error = run_decode(cli).unwrap_err().to_string();
+        assert!(error.contains("--end-offset"), "unexpected error: {error}");
+        assert_eq!(fs::read(luma).unwrap(), original_output);
     }
 }
