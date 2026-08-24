@@ -71,21 +71,21 @@ fn artifact_path(root: &Path, job_id: &str, lease_id: &str, kind: &str) -> PathB
         .join(kind)
 }
 
-fn value_u64(field: &Value, key: &str) -> Result<u64> {
+pub(crate) fn value_u64(field: &Value, key: &str) -> Result<u64> {
     field
         .get(key)
         .and_then(Value::as_u64)
         .with_context(|| format!("field is missing integer {key}"))
 }
 
-fn value_i64(field: &Value, key: &str) -> Result<i64> {
+pub(crate) fn value_i64(field: &Value, key: &str) -> Result<i64> {
     field
         .get(key)
         .and_then(Value::as_i64)
         .with_context(|| format!("field is missing integer {key}"))
 }
 
-fn value_bool(field: &Value, key: &str) -> Result<bool> {
+pub(crate) fn value_bool(field: &Value, key: &str) -> Result<bool> {
     field
         .get(key)
         .and_then(Value::as_bool)
@@ -159,7 +159,7 @@ fn load_shards(manifest: &RunManifest, state: &CoordinatorState) -> Result<Vec<S
     Ok(shards)
 }
 
-fn lower_bound(fields: &[Value], target: u64) -> Result<usize> {
+pub(crate) fn lower_bound(fields: &[Value], target: u64) -> Result<usize> {
     let mut low = 0usize;
     let mut high = fields.len();
     while low < high {
@@ -192,7 +192,7 @@ fn frame_end_at_or_after(fields: &[Value], target: u64) -> Result<usize> {
     Ok(index)
 }
 
-fn read_field(path: &Path, index: usize, field_bytes: u64) -> Result<Vec<u16>> {
+pub(crate) fn read_field(path: &Path, index: usize, field_bytes: u64) -> Result<Vec<u16>> {
     let mut file = File::open(path)?;
     file.seek(SeekFrom::Start(index as u64 * field_bytes))?;
     let mut bytes = vec![0u8; field_bytes as usize];
@@ -203,7 +203,7 @@ fn read_field(path: &Path, index: usize, field_bytes: u64) -> Result<Vec<u16>> {
         .collect())
 }
 
-fn wrapped_msre(reference: &[u16], candidate: &[u16], trim_fraction: f64) -> f64 {
+pub(crate) fn wrapped_msre(reference: &[u16], candidate: &[u16], trim_fraction: f64) -> f64 {
     let mut squared = reference
         .iter()
         .zip(candidate)
@@ -303,14 +303,14 @@ fn find_handoff(
     )
 }
 
-struct Blake3Writer<W> {
+pub(crate) struct Blake3Writer<W> {
     inner: W,
     hasher: blake3::Hasher,
     length: u64,
 }
 
 impl<W: Write> Blake3Writer<W> {
-    fn new(inner: W) -> Self {
+    pub(crate) fn new(inner: W) -> Self {
         Self {
             inner,
             hasher: blake3::Hasher::new(),
@@ -318,7 +318,7 @@ impl<W: Write> Blake3Writer<W> {
         }
     }
 
-    fn finish(mut self) -> Result<(String, u64)> {
+    pub(crate) fn finish(mut self) -> Result<(String, u64)> {
         self.flush()?;
         Ok((self.hasher.finalize().to_hex().to_string(), self.length))
     }
@@ -337,7 +337,7 @@ impl<W: Write> Write for Blake3Writer<W> {
     }
 }
 
-fn copy_fields<W: Write>(
+pub(crate) fn copy_fields<W: Write>(
     input: &Path,
     output: &mut W,
     start: usize,
@@ -358,7 +358,7 @@ fn copy_fields<W: Write>(
     Ok(())
 }
 
-fn phase_id(first_field: bool, global_seq: usize) -> i64 {
+pub(crate) fn phase_id(first_field: bool, global_seq: usize) -> i64 {
     let second_phase = (global_seq / 2).is_multiple_of(2);
     match (first_field, second_phase) {
         (true, true) => 1,

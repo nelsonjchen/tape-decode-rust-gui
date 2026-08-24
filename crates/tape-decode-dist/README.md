@@ -44,6 +44,16 @@ authentication or TLS, so it must not be exposed to an untrusted network.
   shard authoritative until two consecutive overlap fields match by absolute
   `fileLoc`, parity, sync confidence, luma, and chroma. An unmatched seam is a
   hard error.
+- `repair-plan` turns zero-based failed comparison fields into guarded referee
+  decode ranges. Nearby failures are clustered, and ranges whose RF guards
+  overlap are merged so the referee never decodes the same guarded interval
+  twice.
+- `repair-apply` replaces one failed cluster from a guarded referee decode. It
+  uses the last valid matching run immediately before the failure and the first
+  valid run after it, minimizing the replacement while requiring independently
+  proven handoffs on both sides. When applying multiple disjoint repair ranges,
+  apply them from the highest field index downward so a field-count change in a
+  later range cannot invalidate an earlier index.
 - `cleanup` removes only an exact, marked child of `/Users/nelson/NoSync` after
   all external retained artifacts match a retention manifest and no recorded
   process is alive. Retention manifests remain SHA-256-based because they are
@@ -52,3 +62,10 @@ authentication or TLS, so it must not be exposed to an untrusted network.
 Run `tape-decode-dist <command> --help` for the complete arguments. The default
 manifest geometry describes the VHS-0005 `[542,862)` guarded fixture and its
 canonical `[552,852)` interval.
+
+Native heterogeneous decoders can be deterministic on each host yet differ on
+a few threshold-sensitive fields across architectures. A matched VHS-0006
+stress test produced byte-identical repeat runs on both macOS arm64 and Windows
+x86-64, while the two platforms disagreed on a handful of fields. Adaptive
+repair is therefore an explicit referee policy, not a claim that averaging or
+blindly selecting one platform's samples restores ground truth.

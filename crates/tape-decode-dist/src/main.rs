@@ -3,6 +3,7 @@ mod cleanup;
 mod coordinator;
 mod hash;
 mod model;
+mod repair;
 mod runner;
 
 use std::fs;
@@ -39,6 +40,10 @@ enum Command {
     Runner(RunnerArgs),
     /// Stitch all completed shard artifacts into one canonical TBC.
     Assemble(AssembleArgs),
+    /// Plan small guarded repair decodes around failed output fields.
+    RepairPlan(RepairPlanArgs),
+    /// Replace one failed field cluster using a guarded referee decode.
+    RepairApply(RepairApplyArgs),
     /// Remove an explicitly marked scratch root after retained evidence verifies.
     Cleanup(CleanupArgs),
 }
@@ -152,6 +157,57 @@ struct AssembleArgs {
     state: PathBuf,
     #[arg(long)]
     output_prefix: PathBuf,
+}
+
+#[derive(Args)]
+struct RepairPlanArgs {
+    /// Metadata sidecar for the assembled output that failed comparison.
+    #[arg(long)]
+    metadata: PathBuf,
+    /// Zero-based failed output field indices; may be repeated or comma-separated.
+    #[arg(long = "failed-field", required = true, value_delimiter = ',')]
+    failed_fields: Vec<usize>,
+    #[arg(long)]
+    out: PathBuf,
+    /// Failures separated by no more than this many fields share one repair job.
+    #[arg(long, default_value_t = 180)]
+    cluster_gap_fields: usize,
+    /// Canonical context retained around each failed cluster before RF guards.
+    #[arg(long, default_value_t = 4)]
+    canonical_pad_fields: u64,
+    #[arg(long, default_value_t = 5)]
+    guard_seconds: u64,
+    #[arg(long, default_value_t = 28_636_363)]
+    sample_clock: u64,
+    #[arg(long, default_value_t = 477_750)]
+    samples_per_field: u64,
+    /// Optional upper bound for guarded decode ranges, relative to the fixture.
+    #[arg(long)]
+    fixture_samples: Option<u64>,
+}
+
+#[derive(Args)]
+struct RepairApplyArgs {
+    #[arg(long)]
+    base_prefix: PathBuf,
+    #[arg(long)]
+    repair_prefix: PathBuf,
+    #[arg(long)]
+    output_prefix: PathBuf,
+    #[arg(long)]
+    first_failed_field: usize,
+    #[arg(long)]
+    last_failed_field: usize,
+    #[arg(long, default_value_t = 300)]
+    search_fields: u64,
+    #[arg(long, default_value_t = 477_750)]
+    samples_per_field: u64,
+    #[arg(long, default_value_t = 2)]
+    consecutive_matches: usize,
+    #[arg(long, default_value_t = 64.0)]
+    threshold: f64,
+    #[arg(long, default_value_t = 0.10)]
+    trim_fraction: f64,
 }
 
 #[derive(Args)]
@@ -292,6 +348,37 @@ fn main() -> Result<()> {
         }
         Command::Assemble(args) => {
             let report = assemble::run(args.manifest, args.state, args.output_prefix)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::RepairPlan(args) => {
+            let report = repair::plan(
+                args.metadata,
+                args.failed_fields,
+                args.out,
+                args.cluster_gap_fields,
+                args.canonical_pad_fields,
+                args.guard_seconds,
+                args.sample_clock,
+                args.samples_per_field,
+                args.fixture_samples,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            Ok(())
+        }
+        Command::RepairApply(args) => {
+            let report = repair::apply(
+                args.base_prefix,
+                args.repair_prefix,
+                args.output_prefix,
+                args.first_failed_field,
+                args.last_failed_field,
+                args.search_fields,
+                args.samples_per_field,
+                args.consecutive_matches,
+                args.threshold,
+                args.trim_fraction,
+            )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
