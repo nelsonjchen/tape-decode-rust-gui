@@ -10,6 +10,13 @@ use tape_decode::{Decoder, DecoderMetadata, DecoderSpec, LumaOutput, WriteableFi
 use crate::reader::DecodeReader;
 use crate::writer::DecodeWriter;
 
+/// The overlap coordinator only provides useful bounded parallelism with at
+/// least two workers. A single worker has no handoff that can advance the
+/// shared tape's drop threshold, so it must use the serial sliding window.
+pub(crate) fn uses_multithreading(threads: usize) -> bool {
+    threads > 1
+}
+
 /// Decode the whole input serially. Like the multithreaded path, the input is
 /// streamed once from the stream start and the decoder skips past everything
 /// before `start_offset` itself (so this works on non-seekable inputs such as
@@ -94,8 +101,8 @@ pub fn decode_all(
 
 /// Multithreading parameters. See the `--mt-*` CLI flags.
 pub struct MtParams {
-    /// Number of concurrent decoder threads. Must be >= 1 here (the `== 0` case
-    /// is handled by the serial [`decode_all`]).
+    /// Number of concurrent decoder threads. Must be >= 2 here; zero and one
+    /// are handled by the bounded serial [`decode_all`] path.
     pub threads: usize,
     /// Fields of distance between each thread's start offset, and the width of
     /// the overlap window searched for a stitch.
@@ -775,8 +782,8 @@ impl<'a> MtOrchestrator<'a> {
     }
 }
 
-/// Multithreaded counterpart to [`decode_all`]. Requires `mt.threads >= 1`;
-/// `mt.threads == 0` is handled by the serial path. `start_offset` is the
+/// Multithreaded counterpart to [`decode_all`]. Counts below two are handled
+/// by the serial path. `start_offset` is the
 /// absolute sample where decoding begins (`--start-fileloc`, 0 by default).
 ///
 /// The input is streamed once through a shared [`Tape`]; the workers never
@@ -784,12 +791,16 @@ impl<'a> MtOrchestrator<'a> {
 /// The decoders themselves skip past the input before `start_offset`, so
 /// reading still begins at the stream's start.
 pub fn decode_all_mt(
-    reader: DecodeReader,
+    mut reader: DecodeReader,
     writer: &mut DecodeWriter,
     spec: Arc<DecoderSpec>,
     mt: MtParams,
     start_offset: u64,
 ) -> Result<()> {
+    if !uses_multithreading(mt.threads) {
+        return decode_all(&mut reader, writer, spec, start_offset);
+    }
+
     let tape = Arc::new(Tape::new(reader));
     let spf = spec.samples_per_field();
     // A worker only needs to bank its own segment plus the handful of fields it
@@ -822,4 +833,16 @@ pub fn decode_all_mt(
         final_metadata: None,
     };
     orchestrator.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::uses_multithreading;
+
+    #[test]
+    fn one_or_zero_workers_use_the_serial_path() {
+        assert!(!uses_multithreading(0));
+        assert!(!uses_multithreading(1));
+        assert!(uses_multithreading(2));
+    }
 }

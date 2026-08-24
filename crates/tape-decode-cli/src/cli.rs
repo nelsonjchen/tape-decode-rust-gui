@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context as _, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
-use crate::decode::{decode_all, decode_all_mt, MtParams};
+use crate::decode::{decode_all, decode_all_mt, uses_multithreading, MtParams};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
 use crate::metadata::{MetadataContext, PcmAudioParameters, TbcMetadataFull, VideoParameters};
 use crate::os;
@@ -262,7 +262,8 @@ struct DecodeArgs {
     #[arg(long, value_enum, ignore_case = true, default_value = "linear")]
     wow_interpolation_method: CliWowInterpolation,
 
-    /// Number of decoding threads; 0 decodes serially on a single thread.
+    /// Number of decoding threads; 0 or 1 uses the bounded serial path, while
+    /// 2 or more enables overlapping worker decoders.
     #[arg(long, default_value_t = 0)]
     mt_threads: usize,
     /// Fields of distance between each thread's start, and the overlap width searched for a stitch.
@@ -422,7 +423,7 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         ntscj: cli.ntscj,
     };
 
-    if cli.mt_threads != 0 {
+    if uses_multithreading(cli.mt_threads) {
         if cli.mt_distance_size == 0 {
             bail!("--mt-distance-size must be at least 1");
         }
@@ -489,7 +490,7 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
     let start_offset = cli.offset.unwrap_or(0);
     // Both paths stream the input once from the start (so they work on non-seekable
     // inputs) and take `start_offset` directly.
-    if cli.mt_threads == 0 {
+    if !uses_multithreading(cli.mt_threads) {
         decode_all(&mut reader, &mut writer, spec, start_offset)?;
     } else {
         let mt = MtParams {
