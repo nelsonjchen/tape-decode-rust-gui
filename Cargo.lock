@@ -1508,14 +1508,11 @@ name = "tape-decode"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake3",
- "libm",
  "num-traits",
  "realfft",
  "rustfft",
  "sci-rs",
  "serde",
- "serde_json",
  "tracing",
 ]
 
@@ -1524,7 +1521,6 @@ name = "tape-decode-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "blake3",
  "clap",
  "libc",
  "reqwest",

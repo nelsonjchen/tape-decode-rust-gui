@@ -55,14 +55,14 @@ impl DecodeWriter {
         metadata: Option<&DecoderMetadata>,
     ) -> Result<()> {
         match field.luma() {
-            LumaOutput::Encoded(values) => write_u16_le_slice(&mut self.outfile_video, values)?,
-            LumaOutput::Raw(values) => write_f32_le_slice(&mut self.outfile_video, values)?,
+            LumaOutput::Encoded(values) => write_native_slice(&mut self.outfile_video, values)?,
+            LumaOutput::Raw(values) => write_native_slice(&mut self.outfile_video, values)?,
         }
         if let Some(outfile) = &mut self.outfile_chroma {
             let chroma = field
                 .chroma()
                 .context("missing chroma output for chroma file")?;
-            write_u16_le_slice(outfile, chroma)?;
+            write_native_slice(outfile, chroma)?;
         }
         let now = Instant::now();
         let start = self.first_field_write.get_or_insert(now);
@@ -160,134 +160,11 @@ fn append_tail(
     Ok(())
 }
 
-/// Write the canonical little-endian representation of a `u16` raster.
-///
-/// All supported production targets are currently little-endian, so retain the
-/// zero-copy path there. `u16` has no padding bytes and every bit pattern is
-/// valid, which makes viewing this initialized slice as bytes sound.
-#[cfg(target_endian = "little")]
-fn write_u16_le_slice(file: &mut dyn Write, values: &[u16]) -> Result<()> {
+fn write_native_slice<T>(file: &mut dyn Write, values: &[T]) -> Result<()> {
+    // Write the values' native-endian bytes directly, without an intermediate buffer.
     let bytes = unsafe {
         std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
     };
     file.write_all(bytes)?;
     Ok(())
-}
-
-#[cfg(target_endian = "big")]
-fn write_u16_le_slice(file: &mut dyn Write, values: &[u16]) -> Result<()> {
-    write_u16_le_converted(file, values)
-}
-
-/// Write the canonical little-endian representation of a raw `f32` luma
-/// raster. This is a bit-preserving operation: signed zero and NaN payloads are
-/// output exactly as stored in the source slice.
-#[cfg(target_endian = "little")]
-fn write_f32_le_slice(file: &mut dyn Write, values: &[f32]) -> Result<()> {
-    // `f32` has no padding bytes and every bit pattern has a defined object
-    // representation, so this initialized slice can safely be viewed as bytes.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
-    };
-    file.write_all(bytes)?;
-    Ok(())
-}
-
-#[cfg(target_endian = "big")]
-fn write_f32_le_slice(file: &mut dyn Write, values: &[f32]) -> Result<()> {
-    write_f32_le_converted(file, values)
-}
-
-// Keep the big-endian fallback bounded: a full field should not require a
-// field-sized allocation merely to swap byte order.
-#[cfg(any(target_endian = "big", test))]
-const ENDIAN_CONVERSION_BUFFER_BYTES: usize = 16 * 1024;
-
-#[cfg(any(target_endian = "big", test))]
-fn write_u16_le_converted(file: &mut dyn Write, values: &[u16]) -> Result<()> {
-    let mut bytes = [0_u8; ENDIAN_CONVERSION_BUFFER_BYTES];
-    for values_chunk in values.chunks(bytes.len() / std::mem::size_of::<u16>()) {
-        let output = &mut bytes[..std::mem::size_of_val(values_chunk)];
-        for (value, destination) in values_chunk.iter().zip(output.chunks_exact_mut(2)) {
-            destination.copy_from_slice(&value.to_le_bytes());
-        }
-        file.write_all(output)?;
-    }
-    Ok(())
-}
-
-#[cfg(any(target_endian = "big", test))]
-fn write_f32_le_converted(file: &mut dyn Write, values: &[f32]) -> Result<()> {
-    let mut bytes = [0_u8; ENDIAN_CONVERSION_BUFFER_BYTES];
-    for values_chunk in values.chunks(bytes.len() / std::mem::size_of::<f32>()) {
-        let output = &mut bytes[..std::mem::size_of_val(values_chunk)];
-        for (value, destination) in values_chunk.iter().zip(output.chunks_exact_mut(4)) {
-            // Work from the stored IEEE-754 bits so this conversion cannot lose
-            // a sign bit or normalize a NaN payload.
-            destination.copy_from_slice(&value.to_bits().to_le_bytes());
-        }
-        file.write_all(output)?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        write_f32_le_converted, write_f32_le_slice, write_u16_le_converted, write_u16_le_slice,
-        ENDIAN_CONVERSION_BUFFER_BYTES,
-    };
-
-    #[test]
-    fn encoded_luma_and_chroma_are_little_endian() {
-        let values = [0x0000_u16, 0x0001, 0x1234, 0x8000, 0xffff];
-        let expected = [0x00, 0x00, 0x01, 0x00, 0x34, 0x12, 0x00, 0x80, 0xff, 0xff];
-
-        let mut actual = Vec::new();
-        write_u16_le_slice(&mut actual, &values).unwrap();
-        assert_eq!(actual, expected);
-
-        let mut converted = Vec::new();
-        write_u16_le_converted(&mut converted, &values).unwrap();
-        assert_eq!(converted, expected);
-    }
-
-    #[test]
-    fn raw_luma_preserves_ieee_754_bits_in_little_endian_order() {
-        let values = [
-            f32::from_bits(0x0000_0000), // +0.0
-            f32::from_bits(0x8000_0000), // -0.0
-            f32::from_bits(0x3f80_0000), // 1.0
-            f32::from_bits(0x7fc0_1234), // NaN with a payload
-            f32::from_bits(0xff80_0000), // -infinity
-        ];
-        let expected = [
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x80, 0x3f, 0x34, 0x12,
-            0xc0, 0x7f, 0x00, 0x00, 0x80, 0xff,
-        ];
-
-        let mut actual = Vec::new();
-        write_f32_le_slice(&mut actual, &values).unwrap();
-        assert_eq!(actual, expected);
-
-        let mut converted = Vec::new();
-        write_f32_le_converted(&mut converted, &values).unwrap();
-        assert_eq!(converted, expected);
-    }
-
-    #[test]
-    fn conversion_is_exact_across_internal_buffer_boundaries() {
-        let value_count = ENDIAN_CONVERSION_BUFFER_BYTES / std::mem::size_of::<u16>() + 3;
-        let values = (0..value_count)
-            .map(|index| index as u16 ^ 0xa55a)
-            .collect::<Vec<_>>();
-        let expected = values
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect::<Vec<_>>();
-
-        let mut actual = Vec::new();
-        write_u16_le_converted(&mut actual, &values).unwrap();
-        assert_eq!(actual, expected);
-    }
 }

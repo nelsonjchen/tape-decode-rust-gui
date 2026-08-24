@@ -12,47 +12,6 @@ Use nightly Rust for best performance builds.
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
-### Deterministic cross-architecture builds
-
-The ordinary performance build uses architecture-specific FFT/SIMD paths and
-is not a bit-exact cross-architecture contract. Build the scalar deterministic
-variant with its required strict floating-point flags:
-
-```bash
-RUSTFLAGS="-C no-vectorize-loops -C no-vectorize-slp -C llvm-args=--fp-contract=off" \
-  cargo build --release -p tape-decode-cli \
-  --no-default-features --features deterministic
-```
-
-Emit one canonical numeric plan from an approved reference build, then load
-that same file for every conformance decode:
-
-```bash
-tape-decode decode capture.u8 \
-  --profile NTSC_VHS --frequency 28.636363 --mt-threads 0 \
-  --emit-numeric-plan ntsc-vhs-v1.tdnp \
-  --luma-out ref.tbc --chroma-out ref_chroma.tbc \
-  --metadata-out ref.tbc.json
-
-tape-decode decode capture.u8 \
-  --profile NTSC_VHS --frequency 28.636363 --mt-threads 0 \
-  --load-numeric-plan ntsc-vhs-v1.tdnp \
-  --luma-out candidate.tbc --chroma-out candidate_chroma.tbc \
-  --metadata-out candidate.tbc.json
-
-tape-decode verify-exact \
-  --metadata ref.tbc.json candidate.tbc.json \
-  --luma ref.tbc candidate.tbc \
-  --chroma ref_chroma.tbc candidate_chroma.tbc
-```
-
-The plan is bound to the exact resolved request/profile/rate and validates
-scalar and FFT witnesses before use. `--cafc`, `--chroma-trap`, and SECAM
-method 1 currently fail closed because their complete runtime numeric state is
-not yet represented. Build identity, input hash, offsets, and serial versus
-multithreaded/distributed topology remain part of the surrounding job contract;
-exact verification is still required.
-
 
 ### Pre-built binaries
 

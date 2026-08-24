@@ -7,14 +7,8 @@ edition = "2021"
 name = "tape-decode"
 path = "src/main.rs"
 
-[features]
-default = ["native-fft"]
-native-fft = ["tape-decode/native-fft"]
-deterministic = ["tape-decode/deterministic"]
-
 [dependencies]
 anyhow = "1"
-blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,7 +16,7 @@ symphonia-bundle-flac = "0.6"
 symphonia-core = "0.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tape-decode = { path = "../tape-decode", default-features = false }
+tape-decode = { path = "../tape-decode" }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 

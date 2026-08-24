@@ -1,15 +1,15 @@
 use anyhow::{bail, Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 /// Shelving filter orientation used by custom profile filters and [`crate::spec::gen_shelf`].
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize)]
 pub enum ShelfKind {
     Low,
     High,
 }
 
 /// How to react when two consecutive fields share the same field order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 pub enum FieldOrderAction {
     Detect,
     Duplicate,
@@ -17,7 +17,7 @@ pub enum FieldOrderAction {
     None,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct DecodeOptions {
     pub cafc: bool,
@@ -42,7 +42,7 @@ impl Default for DecodeOptions {
 }
 
 /// Interpolation used by the wow level adjustment, mapped to a spline degree.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
 pub enum WowInterpolation {
     Linear,
     Quadratic,
@@ -59,7 +59,7 @@ impl WowInterpolation {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DecodeProfile {
     pub sys_params: SysParams,
     pub decoder_params: DecoderParams,
@@ -69,7 +69,7 @@ pub struct DecodeProfile {
 
 /// Scanning standard, defined purely by line count. Luma decoding depends only
 /// on this.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
 #[serde(try_from = "usize")]
 pub enum LineSystem {
     Line405 = 405,
@@ -101,7 +101,7 @@ impl LineSystem {
 
 /// Colour encoding standard configured by resolved system parameters. Profiles
 /// with no chroma processing use [`ColorSystem::Monochrome`].
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Deserialize)]
 pub enum ColorSystem {
     #[serde(rename = "NTSC")]
     Ntsc,
@@ -112,7 +112,7 @@ pub enum ColorSystem {
     Monochrome,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SysParams {
     pub color_system: ColorSystem,
     pub fsc_mhz: f64,
@@ -140,7 +140,7 @@ pub struct SysParams {
     pub nonlinear_deviation: Option<f32>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DecoderParams {
     pub video_bpf: Option<VideoBpf>,
     pub video_lpf_freq: f64,
@@ -182,62 +182,62 @@ pub struct DecoderParams {
     pub boost_ramp: Option<BoostRampFilter>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct VideoEqBand {
     pub corner: f64,
     pub transition: f64,
     pub order_limit: usize,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct VideoEqParams {
     pub loband: VideoEqBand,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct FmAudioChannels {
     pub channel_0_freq: f64,
     pub channel_1_freq: f64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RfPeaking {
     pub freq: f64,
     pub gain: f64,
     pub bandwidth: f64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct NotchFilter {
     pub freq: f64,
     pub q: f64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct BoostRampFilter {
     pub rf_linear_0: f64,
     pub rf_linear_20: f64,
     pub start_freq: f64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct VideoBpf {
     pub low: f64,
     pub high: f64,
     pub order: usize,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct BoostBpf {
     pub low: f64,
     pub high: f64,
     pub mult: f64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DeemphasisParams {
     pub mid: f64,
     pub gain: f64,
     pub q: f64,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct LogisticParams {
     pub mid: f32,
     pub rate: f32,
 }
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct NonlinearParams {
     pub highpass_freq: f64,
     pub highpass_limit_h: f32,
@@ -253,7 +253,7 @@ pub struct NonlinearParams {
     pub use_sub_deemphasis: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(tag = "kind")]
 pub enum VideoLumaFilter {
     File {
@@ -267,7 +267,7 @@ pub enum VideoLumaFilter {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct DecodeRequest {
     pub inputfreq: f64,
 

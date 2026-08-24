@@ -87,7 +87,7 @@ fn snr_at(
     if noise == 0.0 {
         0.0
     } else {
-        20.0 * libm::log10(100.0 / noise)
+        20.0 * (100.0 / noise).log10()
     }
 }
 
