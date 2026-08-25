@@ -19,20 +19,6 @@ pub(crate) fn uses_multithreading(threads: usize) -> bool {
     threads > 1
 }
 
-/// Decode the whole input serially. Like the multithreaded path, the input is
-/// streamed once from the stream start and the decoder skips past everything
-/// before `start_offset` itself (so this works on non-seekable inputs such as
-/// pipes); `start_offset` is taken directly rather than inferred from the
-/// reader's position.
-pub fn decode_all(
-    reader: &mut DecodeReader,
-    writer: &mut DecodeWriter,
-    spec: Arc<DecoderSpec>,
-    start_offset: u64,
-) -> Result<()> {
-    decode_all_with_backend(reader, writer, spec, start_offset, DecodeBackend::Cpu)
-}
-
 /// Serial decoding with an explicitly selected block backend.
 pub fn decode_all_with_backend(
     reader: &mut DecodeReader,
@@ -353,12 +339,13 @@ enum WorkerMsg {
 fn decode_segment(
     spec: &Arc<DecoderSpec>,
     tape: &Tape,
+    backend: DecodeBackend,
     start_offset: u64,
     start_needed: u64,
     tx: &SyncSender<WorkerMsg>,
     stop: &AtomicBool,
 ) -> Result<Option<DecoderMetadata>> {
-    let mut decoder = Decoder::new(Arc::clone(spec), start_offset);
+    let mut decoder = Decoder::new_with_backend(Arc::clone(spec), start_offset, backend)?;
     let chunk = spec.readlen() + 4 * BLOCKSIZE;
     let mut window: Vec<f32> = Vec::new();
     let mut read_buffer = vec![0.0f32; chunk];
@@ -431,6 +418,7 @@ impl Worker {
     fn spawn(
         spec: &Arc<DecoderSpec>,
         tape: &Arc<Tape>,
+        backend: DecodeBackend,
         start_offset: u64,
         start_needed: u64,
         capacity: usize,
@@ -441,8 +429,15 @@ impl Worker {
         let tape = Arc::clone(tape);
         let worker_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            let outcome =
-                decode_segment(&spec, &tape, start_offset, start_needed, &tx, &worker_stop);
+            let outcome = decode_segment(
+                &spec,
+                &tape,
+                backend,
+                start_offset,
+                start_needed,
+                &tx,
+                &worker_stop,
+            );
             // If we were stopped, the receiver is gone and the result is moot.
             if !worker_stop.load(Ordering::Relaxed) {
                 let _ = tx.send(WorkerMsg::Done(outcome));
@@ -535,6 +530,7 @@ struct MtOrchestrator<'a> {
     spec: Arc<DecoderSpec>,
     /// Shared single-pass view of the input, streamed once to all workers.
     tape: Arc<Tape>,
+    backend: DecodeBackend,
     mt: MtParams,
     /// Absolute sample offset where decoding begins (honors `--start-fileloc`).
     global_base: u64,
@@ -580,6 +576,7 @@ impl<'a> MtOrchestrator<'a> {
             let worker = Worker::spawn(
                 &self.spec,
                 &self.tape,
+                self.backend,
                 start_offset,
                 start_needed,
                 self.capacity,
@@ -795,7 +792,7 @@ impl<'a> MtOrchestrator<'a> {
     }
 }
 
-/// Multithreaded counterpart to [`decode_all`]. Counts below two are handled
+/// Multithreaded counterpart to [`decode_all_with_backend`]. Counts below two are handled
 /// by the serial path. `start_offset` is the
 /// absolute sample where decoding begins (`--start-fileloc`, 0 by default).
 ///
@@ -803,15 +800,19 @@ impl<'a> MtOrchestrator<'a> {
 /// reopen, seek, or stat it, so this runs on non-seekable inputs such as pipes.
 /// The decoders themselves skip past the input before `start_offset`, so
 /// reading still begins at the stream's start.
-pub fn decode_all_mt(
+/// Bounded multithreaded decoding with an explicit block backend. CUDA workers
+/// share the same sequential [`Tape`] and use independent streams on the
+/// selected device, allowing GPU work to overlap CPU field processing.
+pub fn decode_all_mt_with_backend(
     mut reader: DecodeReader,
     writer: &mut DecodeWriter,
     spec: Arc<DecoderSpec>,
     mt: MtParams,
     start_offset: u64,
+    backend: DecodeBackend,
 ) -> Result<()> {
     if !uses_multithreading(mt.threads) {
-        return decode_all(&mut reader, writer, spec, start_offset);
+        return decode_all_with_backend(&mut reader, writer, spec, start_offset, backend);
     }
 
     let tape = Arc::new(Tape::new(reader));
@@ -835,6 +836,7 @@ pub fn decode_all_mt(
         writer,
         spec,
         tape,
+        backend,
         mt,
         global_base: start_offset,
         spf,

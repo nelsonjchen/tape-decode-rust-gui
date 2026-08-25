@@ -17,7 +17,6 @@ use cudarc::driver::{
 use cudarc::nvrtc::{result as nvrtc_result, sys as nvrtc_sys, Ptx};
 
 use super::{iretohz, ColorSystem, DecoderSpec, VideoChannels, BLOCKCUT, BLOCKSIZE};
-use crate::optimized::sosfiltfilt_f32;
 
 const KERNEL_SOURCE: &str = include_str!("cuda_kernels.cu");
 const NVRTC_OPTIONS_TAG: &str =
@@ -37,6 +36,7 @@ struct Kernels {
     filter_complex: CudaFunction,
     analytic_expand: CudaFunction,
     demod_envelope: CudaFunction,
+    filter_envelope_scan: CudaFunction,
     demod_diffed: CudaFunction,
     mark_candidates: CudaFunction,
     repair_spikes: CudaFunction,
@@ -55,6 +55,7 @@ impl Kernels {
             filter_complex: module.load_function("filter_complex")?,
             analytic_expand: module.load_function("analytic_expand")?,
             demod_envelope: module.load_function("demod_envelope")?,
+            filter_envelope_scan: module.load_function("filter_envelope_scan")?,
             demod_diffed: module.load_function("demod_diffed")?,
             mark_candidates: module.load_function("mark_candidates")?,
             repair_spikes: module.load_function("repair_spikes")?,
@@ -75,6 +76,8 @@ struct CudaBatch {
     diffed_demod: CudaSlice<f32>,
     candidates: CudaSlice<u8>,
     raw_envelope: CudaSlice<f32>,
+    envelope_work: CudaSlice<f32>,
+    packed_envelope: CudaSlice<f32>,
     demod_fft: CudaSlice<cufft_sys::float2>,
     video_fft: CudaSlice<cufft_sys::float2>,
     video05_fft: CudaSlice<cufft_sys::float2>,
@@ -163,6 +166,8 @@ impl CudaBatch {
             diffed_demod: stream.alloc_zeros(real_len)?,
             candidates: stream.alloc_zeros(real_len)?,
             raw_envelope: stream.alloc_zeros(real_len)?,
+            envelope_work: stream.alloc_zeros(blocks * (BLOCKSIZE + 6))?,
+            packed_envelope: stream.alloc_zeros(packed_len)?,
             demod_fft: stream.alloc_zeros(spectrum_len)?,
             video_fft: stream.alloc_zeros(spectrum_len)?,
             video05_fft: stream.alloc_zeros(spectrum_len)?,
@@ -178,7 +183,7 @@ impl CudaBatch {
             r2c_blocks,
             c2r,
             c2c_inverse,
-            host_envelope: vec![0.0; real_len],
+            host_envelope: vec![0.0; packed_len],
             host_video: vec![0.0; packed_len],
             host_video05: vec![0.0; packed_len],
             host_burst: vec![0.0; packed_len],
@@ -285,7 +290,29 @@ impl CudaBlockDecoder {
         let ire0 = spec.sys_ire0;
         let freq = spec.freq_hz() as f32;
         let spike_threshold = iretohz(ire0, spec.sys_hz_ire, 100.0) * 2.0 - ire0;
-
+        let env_section = spec
+            .video_env_post_filter
+            .first()
+            .context("missing CUDA envelope post-filter")?;
+        if spec.video_env_post_filter.len() != 1
+            || env_section.b[2] != 0.0
+            || env_section.a[2] != 0.0
+        {
+            bail!("CUDA envelope post-filter requires one first-order SOS section");
+        }
+        let env_b0 = env_section.b[0];
+        let env_recurrence = -env_section.a[1];
+        let env_feed_forward = env_section.b[1] - env_section.a[1] * env_section.b[0];
+        let env_zi0 = {
+            let a0 = f64::from(env_section.a[0]);
+            let b0 = f64::from(env_section.b[0]) / a0;
+            let b1 = f64::from(env_section.b[1]) / a0;
+            let b2 = f64::from(env_section.b[2]) / a0;
+            let a1 = f64::from(env_section.a[1]) / a0;
+            let a2 = f64::from(env_section.a[2]) / a0;
+            let b1_term = b1 - a1 * b0;
+            ((b1_term + (b2 - a2 * b0)) / (1.0 + a1 + a2)) as f32
+        };
         self.stream.memcpy_htod(rawdata, &mut batch.input)?;
         batch.r2c_raw.exec_r2c(&batch.input, &mut batch.raw_fft)?;
         self.stream.memcpy_dtod(&batch.raw_fft, &mut batch.rf_fft)?;
@@ -332,6 +359,24 @@ impl CudaBlockDecoder {
                 .arg(&ire0)
                 .launch(LaunchConfig::for_num_elems(real_total as u32))?;
             self.stream
+                .launch_builder(&self.kernels.filter_envelope_scan)
+                .arg(&batch.raw_envelope)
+                .arg(&mut batch.envelope_work)
+                .arg(&mut batch.packed_envelope)
+                .arg(&n)
+                .arg(&usable_i32)
+                .arg(&cut)
+                .arg(&block_count)
+                .arg(&env_b0)
+                .arg(&env_recurrence)
+                .arg(&env_feed_forward)
+                .arg(&env_zi0)
+                .launch(LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+            self.stream
                 .launch_builder(&self.kernels.mark_candidates)
                 .arg(&batch.demod)
                 .arg(&mut batch.candidates)
@@ -346,7 +391,11 @@ impl CudaBlockDecoder {
                 .arg(&n)
                 .arg(&block_count)
                 .arg(&spike_threshold)
-                .launch(LaunchConfig::for_num_elems(blocks as u32))?;
+                .launch(LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
         }
 
         batch
@@ -414,7 +463,11 @@ impl CudaBlockDecoder {
                     .arg(&n)
                     .arg(&block_count)
                     .arg(&inv_n)
-                    .launch(LaunchConfig::for_num_elems(blocks as u32))?;
+                    .launch(LaunchConfig {
+                        grid_dim: (blocks as u32, 1, 1),
+                        block_dim: (32, 1, 1),
+                        shared_mem_bytes: 0,
+                    })?;
                 let chroma_shift = spec.chroma_offset() as i32;
                 self.stream
                     .launch_builder(&self.kernels.pack_burst)
@@ -432,7 +485,7 @@ impl CudaBlockDecoder {
         }
 
         self.stream
-            .memcpy_dtoh(&batch.raw_envelope, &mut batch.host_envelope)?;
+            .memcpy_dtoh(&batch.packed_envelope, &mut batch.host_envelope)?;
         self.stream
             .memcpy_dtoh(&batch.packed_video, &mut batch.host_video)?;
         self.stream
@@ -445,15 +498,9 @@ impl CudaBlockDecoder {
 
         out.demod.extend_from_slice(&batch.host_video);
         out.demod_05.extend_from_slice(&batch.host_video05);
-        for block in 0..blocks {
-            let start = block * BLOCKSIZE;
-            let env = sosfiltfilt_f32(
-                &spec.video_env_post_filter,
-                &batch.host_envelope[start..start + BLOCKSIZE],
-            );
-            out.envelope
-                .extend_from_slice(&env[BLOCKCUT..BLOCKSIZE - BLOCKCUT]);
-            if spec.chroma_afc_enabled() {
+        out.envelope.extend_from_slice(&batch.host_envelope);
+        if spec.chroma_afc_enabled() {
+            for block in 0..blocks {
                 let raw_start = block * usable + BLOCKCUT;
                 out.demod_burst
                     .extend_from_slice(&rawdata[raw_start..raw_start + usable]);
@@ -553,6 +600,8 @@ fn load_or_compile_cubin(major: i32, minor: i32) -> Result<Ptx> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimized::{sosfiltfilt_f32, sum_algebraic};
+    use sci_rs::signal::filter::design::Sos;
 
     #[test]
     fn cubin_cache_key_changes_with_architecture() {
@@ -610,6 +659,153 @@ mod tests {
             .map(|(&expected, actual)| (expected - actual * inv_n).abs())
             .fold(0.0f32, f32::max);
         assert!(max_error < 2.0e-5, "cuFFT round-trip error {max_error}");
+        Ok(())
+    }
+
+    #[test]
+    fn envelope_reductions_and_spike_repair_match_cpu_primitives() -> Result<()> {
+        let Ok(context) =
+            catch_cuda_initialization(|| CudaContext::new(0).map_err(anyhow::Error::from))
+        else {
+            return Ok(());
+        };
+        let (major, minor) = context.compute_capability()?;
+        let Ok(image) = catch_cuda_initialization(|| load_or_compile_cubin(major, minor)) else {
+            return Ok(());
+        };
+        let kernels = Kernels::load(&context, image)?;
+        let stream = context.default_stream();
+        let blocks = 3usize;
+        let usable = BLOCKSIZE - 2 * BLOCKCUT;
+        let real_len = blocks * BLOCKSIZE;
+        let packed_len = blocks * usable;
+        let n = BLOCKSIZE as i32;
+        let usable_i32 = usable as i32;
+        let cut = BLOCKCUT as i32;
+        let block_count = blocks as i32;
+
+        let section = Sos::new([0.12f32, 0.12, 0.0], [1.0, -0.76, 0.0]);
+        let raw = (0..real_len)
+            .map(|index| {
+                let x = index as f32;
+                0.65 * (x * 0.003_17).sin() + 0.2 * (x * 0.021_3).cos()
+            })
+            .collect::<Vec<_>>();
+        let mut device_raw = stream.clone_htod(&raw)?;
+        let mut work: CudaSlice<f32> = stream.alloc_zeros(blocks * (BLOCKSIZE + 6))?;
+        let mut packed: CudaSlice<f32> = stream.alloc_zeros(packed_len)?;
+        let b0 = section.b[0];
+        let recurrence = -section.a[1];
+        let feed_forward = section.b[1] - section.a[1] * section.b[0];
+        let zi0 = ((section.b[1] - section.a[1] * section.b[0])
+            + (section.b[2] - section.a[2] * section.b[0]))
+            / (1.0 + section.a[1] + section.a[2]);
+        unsafe {
+            stream
+                .launch_builder(&kernels.filter_envelope_scan)
+                .arg(&mut device_raw)
+                .arg(&mut work)
+                .arg(&mut packed)
+                .arg(&n)
+                .arg(&usable_i32)
+                .arg(&cut)
+                .arg(&block_count)
+                .arg(&b0)
+                .arg(&recurrence)
+                .arg(&feed_forward)
+                .arg(&zi0)
+                .launch(LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let mut actual_envelope = vec![0.0; packed_len];
+        stream.memcpy_dtoh(&packed, &mut actual_envelope)?;
+        stream.synchronize()?;
+        let mut expected_envelope = Vec::with_capacity(packed_len);
+        for block in raw.chunks_exact(BLOCKSIZE) {
+            let filtered = sosfiltfilt_f32(&[section], block);
+            expected_envelope.extend_from_slice(&filtered[BLOCKCUT..BLOCKSIZE - BLOCKCUT]);
+        }
+        let envelope_error = expected_envelope
+            .iter()
+            .zip(&actual_envelope)
+            .map(|(&expected, &actual)| (expected - actual).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            envelope_error < 2.0e-4,
+            "parallel envelope scan error {envelope_error}"
+        );
+
+        let burst = (0..real_len)
+            .map(|index| {
+                let x = index as f32;
+                1200.0 * (x * 0.007_31).sin() + (index % 37) as f32
+            })
+            .collect::<Vec<_>>();
+        let device_burst = stream.clone_htod(&burst)?;
+        let mut device_means: CudaSlice<f32> = stream.alloc_zeros(blocks)?;
+        let inv_n = 1.0 / BLOCKSIZE as f32;
+        unsafe {
+            stream
+                .launch_builder(&kernels.burst_means)
+                .arg(&device_burst)
+                .arg(&mut device_means)
+                .arg(&n)
+                .arg(&block_count)
+                .arg(&inv_n)
+                .launch(LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (32, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let mut actual_means = vec![0.0; blocks];
+        stream.memcpy_dtoh(&device_means, &mut actual_means)?;
+        stream.synchronize()?;
+        for (block, &actual) in burst.chunks_exact(BLOCKSIZE).zip(&actual_means) {
+            let normalized = block.iter().map(|&value| value * inv_n).collect::<Vec<_>>();
+            let expected = sum_algebraic(&normalized) * inv_n;
+            assert!(
+                (expected - actual).abs() < 2.0e-7,
+                "parallel burst mean: expected {expected}, got {actual}"
+            );
+        }
+
+        let threshold = 100.0f32;
+        let spike_index = BLOCKSIZE + 100;
+        let mut demod = vec![1.0f32; real_len];
+        demod[spike_index] = 200.0;
+        let diffed = vec![0.0f32; real_len];
+        let mut candidates = vec![0u8; real_len];
+        candidates[spike_index] = 1;
+        let mut device_demod = stream.clone_htod(&demod)?;
+        let device_diffed = stream.clone_htod(&diffed)?;
+        let device_candidates = stream.clone_htod(&candidates)?;
+        unsafe {
+            stream
+                .launch_builder(&kernels.repair_spikes)
+                .arg(&mut device_demod)
+                .arg(&device_diffed)
+                .arg(&device_candidates)
+                .arg(&n)
+                .arg(&block_count)
+                .arg(&threshold)
+                .launch(LaunchConfig {
+                    grid_dim: (blocks as u32, 1, 1),
+                    block_dim: (256, 1, 1),
+                    shared_mem_bytes: 0,
+                })?;
+        }
+        let mut repaired = vec![0.0f32; real_len];
+        stream.memcpy_dtoh(&device_demod, &mut repaired)?;
+        stream.synchronize()?;
+        assert_eq!(repaired[spike_index - 9], 1.0);
+        assert!(repaired[spike_index - 8..spike_index + 30]
+            .iter()
+            .all(|&value| value == 0.0));
+        assert_eq!(repaired[spike_index + 30], 1.0);
         Ok(())
     }
 }

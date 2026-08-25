@@ -9,7 +9,9 @@ use std::sync::Arc;
 use anyhow::{bail, Context as _, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
-use crate::decode::{decode_all_mt, decode_all_with_backend, uses_multithreading, MtParams};
+use crate::decode::{
+    decode_all_mt_with_backend, decode_all_with_backend, uses_multithreading, MtParams,
+};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
 use crate::metadata::{MetadataContext, PcmAudioParameters, TbcMetadataFull, VideoParameters};
 use crate::os;
@@ -524,7 +526,7 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
             threshold: cli.mt_threshold,
             trim_fraction: cli.mt_trim_fraction,
         };
-        decode_all_mt(reader, &mut writer, spec, mt, start_offset)?;
+        decode_all_mt_with_backend(reader, &mut writer, spec, mt, start_offset, backend)?;
     }
     Ok(())
 }
@@ -532,9 +534,6 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
 fn validate_cuda_args(cli: &DecodeArgs) -> Result<()> {
     if cli.profile.as_deref() != Some("NTSC_VHS") || cli.profile_file.is_some() {
         bail!("CUDA currently supports only the embedded --profile NTSC_VHS graph");
-    }
-    if uses_multithreading(cli.mt_threads) {
-        bail!("CUDA owns field batching and cannot be combined with --mt-threads >= 2");
     }
     let frequency = cli.frequency.unwrap_or(40.0);
     if (frequency - 28.636363).abs() > 0.000001 {
@@ -1113,13 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn cuda_rejects_multithreaded_and_modified_graphs() {
-        let mt = parse_decode(&["--backend", "cuda", "--mt-threads", "2"]);
-        assert!(validate_cuda_args(&mt)
-            .unwrap_err()
-            .to_string()
-            .contains("field batching"));
-
+    fn cuda_rejects_modified_graphs() {
         let sharp = parse_decode(&["--backend", "cuda", "--sharpness", "10"]);
         assert!(validate_cuda_args(&sharp)
             .unwrap_err()

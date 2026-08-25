@@ -49,10 +49,13 @@ tape-decode decode \
 
 The first implementation supports only the embedded `NTSC_VHS` graph at
 28,636,363 Hz. It rejects custom profiles, graph-changing options, unavailable
-devices, and `--mt-threads >= 2` without falling back to CPU. It dynamically
-loads CUDA/NVRTC/cuFFT and compiles a CUBIN for the selected device's compute
+devices, and unsupported formats without falling back to CPU. CUDA can use the
+existing bounded multi-worker path; this improves throughput on clean material,
+but independent decoder state can still diverge around unstable sync, so its
+output remains non-authoritative. The backend dynamically loads
+CUDA/NVRTC/cuFFT and compiles a CUBIN for the selected device's compute
 capability on first use. See [the CUDA backend notes](docs/cuda-backend.md) for
-architecture, validation status, and limitations.
+architecture, measured results, and limitations.
 
 ## Decode Launcher GUI (decode-rust-gui)
 

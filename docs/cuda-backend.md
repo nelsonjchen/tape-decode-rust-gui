@@ -21,6 +21,9 @@ The backend applies the usual high-throughput GPU DSP structure to the existing
 - device kernels apply RF gains, construct the one-sided analytic spectrum,
   extract the envelope, perform phase and differential demodulation, repair
   spikes, apply luma filters, and extract the burst channel;
+- the first-order zero-phase envelope filter uses a device-wide affine scan,
+  while spike detection and burst-DC removal use parallel reductions rather
+  than one serial CUDA thread per RF block;
 - packed usable block interiors are copied back to the existing CPU field,
   sync, chroma, scaling, dropout, and metadata pipeline;
 - device buffers and cuFFT plans are retained by batch shape and reused; and
@@ -28,8 +31,11 @@ The backend applies the usual high-throughput GPU DSP structure to the existing
   agreement with the scalar Rust phase path. The CUBIN cache key includes the
   kernel source, crate version, architecture, and compiler options.
 
-This is a deliberately bounded first cut. It does not change the sequential
-input producer, duplicate the source reader, or seek/reopen compressed input.
+The existing bounded multi-worker path can give each worker an independent CUDA
+stream while retaining one forward-only shared input producer. Workers do not
+reopen or seek the source. This improves overlap between GPU block work and CPU
+field processing, but does not transfer decoder history between speculative
+segments.
 
 Primary implementation references:
 
@@ -56,6 +62,8 @@ tape-decode decode \
   --frequency 28.636363M \
   --backend cuda \
   --cuda-device 0 \
+  --mt-threads 12 \
+  --mt-distance-size 108 \
   --luma-out decoded.tbc \
   --chroma-out decoded_chroma.tbc \
   --metadata-out decoded.tbc.json \
@@ -67,7 +75,13 @@ are rejected before output files are opened; driver, library, and device errors
 are reported when the decoder backend is constructed. In particular, CUDA v1
 rejects custom profiles, non-NTSC systems, nonstandard sample rates, raw-TBC
 export, notch/high-boost/sharpness/chroma-trap/nonlinear block-graph changes,
-disabled differential demodulation, and multi-worker decoding.
+and disabled differential demodulation.
+
+Multi-worker CUDA is accepted but remains experimental. Each segment starts
+with fresh sync, level, and chroma state. A short overlap match is sufficient on
+the clean fixtures, but it does not prove future state equivalence on unstable
+material. Use the serial CUDA path when isolating GPU numerical behavior from
+the multi-worker stitcher, and use CPU output for preservation work.
 
 ## Validation gates
 
@@ -83,8 +97,9 @@ requires:
 - bounded device memory below 8 GB with no per-block allocation growth.
 
 Device tests cover unavailable ordinals, exact-architecture CUBIN cache keys,
-partial and multi-block cuFFT plans, and inverse-transform normalization. The
-CLI tests cover default CPU selection and fail-closed CUDA option validation.
+partial and multi-block cuFFT plans, inverse-transform normalization, the
+parallel envelope scan, burst reduction, and spike repair. The CLI tests cover
+default CPU selection and fail-closed CUDA option validation.
 
 ## Measured result on Reverie (2026-08-25)
 
@@ -123,3 +138,44 @@ improvement is claimed, and CUDA output remains non-authoritative.
 Artifacts are retained on Reverie under
 `D:\VHS-Decode\tape-decode-cuda-dev\corpus-final-v2` and
 `D:\VHS-Decode\tape-decode-cuda-dev\benchmark-final`.
+
+## Multi-stream optimization pass (2026-08-25)
+
+A second pass connected CUDA to the bounded shared-`Tape` worker architecture.
+Twelve workers use independent streams on the same primary context; the input
+still has one forward-only producer. Nsight Compute identified two accidentally
+serial kernels: spike detection and burst mean removal each scanned an entire
+32,768-sample block from one thread. Parallel reductions, plus the device
+envelope scan, reduced observed block-backend service from roughly 12.5 to
+7.5-8.2 ms per field under load. Registered/pinned host-buffer experiments and
+cached phase arrays did not improve end-to-end time and were not retained.
+
+The final three-run VHS-0005 timing set used `--mt-threads 12` and
+`--mt-distance-size 108` for both backends:
+
+| Backend | Runs (seconds) | Median | CPU/CUDA ratio |
+| --- | --- | ---: | ---: |
+| CPU | 16.595, 16.289, 16.303 | 16.303 | - |
+| CUDA | 13.990, 14.131, 13.640 | 13.990 | 1.165x |
+
+This is substantially faster than the serial CUDA prototype, but it remains
+below the required 1.5x threshold, so no performance-improvement claim is made.
+Worker-count and distance sweeps found twelve workers and roughly 100-108 fields
+per segment best for this 20-second fixture. Observed framebuffer use during
+the scaling runs stayed between 819 and 4,028 MiB, below the 8 GB gate, with no
+per-field allocation growth.
+
+The final multi-worker eight-window sweep preserved the original three clean
+passes, the known one-field/outlier failures, and matching zero-field no-lock
+behavior. The endpoint-collapse fixture also exposed a multi-worker-only failure
+cluster at fields 586-611: a speculative decoder matched at its stitch, then
+diverged when later unstable material exercised its independently initialized
+state. A serial CUDA rerun did not contain that extra cluster, confirming that
+it is a state-stitching limitation rather than a new CUDA-kernel error. The
+no-lock case completed safely but took 79.8 seconds because all speculative
+workers scanned to EOF before proving there was no field.
+
+Optimized artifacts are retained under
+`D:\VHS-Decode\tape-decode-cuda-dev\corpus-opt-v3-mt`,
+`D:\VHS-Decode\tape-decode-cuda-dev\quality-opt-v3-serial`, and
+`D:\VHS-Decode\tape-decode-cuda-dev\benchmark-opt-v3.json`.

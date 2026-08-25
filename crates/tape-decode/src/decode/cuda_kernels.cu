@@ -130,6 +130,156 @@ extern "C" __global__ void demod_diffed(
     output[i] = unwrap_pair(prev, curr, freq, offset);
 }
 
+__device__ __forceinline__ float sos1_step(
+    float sample,
+    float b0,
+    float recurrence,
+    float feed_forward,
+    float* state
+) {
+    const float output = fmaf(b0, sample, *state);
+    *state = fmaf(recurrence, *state, feed_forward * sample);
+    return output;
+}
+
+extern "C" __global__ void filter_envelope_scan(
+    const float* raw,
+    float* work,
+    float* packed,
+    int n,
+    int usable,
+    int cut,
+    int blocks,
+    float b0,
+    float recurrence,
+    float feed_forward,
+    float zi0_base
+) {
+    const int signal = (int)blockIdx.x;
+    const int lane = (int)threadIdx.x;
+    if (signal >= blocks) return;
+    const int edge = 6;
+    const int chunk = 33;
+    const int total = n + edge;
+    const float* input = raw + signal * n;
+    float* filtered = work + signal * total;
+    __shared__ float scan_a[1024];
+    __shared__ float scan_b[1024];
+    __shared__ float initial_state;
+
+    if (lane == 0) {
+        const float left_end = input[0];
+        float state = zi0_base * (2.0f * left_end - input[edge]);
+        for (int i = edge; i >= 1; --i) {
+            sos1_step(
+                2.0f * left_end - input[i], b0, recurrence, feed_forward, &state
+            );
+        }
+        initial_state = state;
+    }
+
+    int begin = lane * chunk;
+    int end = begin + chunk;
+    if (end > total) end = total;
+    float transform_a = 1.0f;
+    float transform_b = 0.0f;
+    const float right_end = input[n - 1];
+    for (int i = begin; i < end; ++i) {
+        const float sample = i < n
+            ? input[i]
+            : 2.0f * right_end - input[n - 1 - (i - n + 1)];
+        transform_b = fmaf(recurrence, transform_b, feed_forward * sample);
+        transform_a *= recurrence;
+    }
+    scan_a[lane] = transform_a;
+    scan_b[lane] = transform_b;
+    __syncthreads();
+    for (int offset = 1; offset < 1024; offset <<= 1) {
+        float previous_a = 1.0f;
+        float previous_b = 0.0f;
+        const float current_a = scan_a[lane];
+        const float current_b = scan_b[lane];
+        if (lane >= offset) {
+            previous_a = scan_a[lane - offset];
+            previous_b = scan_b[lane - offset];
+        }
+        __syncthreads();
+        if (lane >= offset) {
+            scan_a[lane] = current_a * previous_a;
+            scan_b[lane] = fmaf(current_a, previous_b, current_b);
+        }
+        __syncthreads();
+    }
+    float state = initial_state;
+    if (lane > 0) {
+        state = fmaf(scan_a[lane - 1], initial_state, scan_b[lane - 1]);
+    }
+    for (int i = begin; i < end; ++i) {
+        const float sample = i < n
+            ? input[i]
+            : 2.0f * right_end - input[n - 1 - (i - n + 1)];
+        filtered[i] = sos1_step(sample, b0, recurrence, feed_forward, &state);
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        float backward_state = zi0_base * filtered[total - 1];
+        for (int padding = 0; padding < edge; ++padding) {
+            sos1_step(
+                filtered[total - 1 - padding],
+                b0,
+                recurrence,
+                feed_forward,
+                &backward_state
+            );
+        }
+        initial_state = backward_state;
+    }
+
+    begin = lane * chunk;
+    end = begin + chunk;
+    if (end > n) end = n;
+    transform_a = 1.0f;
+    transform_b = 0.0f;
+    for (int i = begin; i < end; ++i) {
+        const float sample = filtered[n - 1 - i];
+        transform_b = fmaf(recurrence, transform_b, feed_forward * sample);
+        transform_a *= recurrence;
+    }
+    scan_a[lane] = transform_a;
+    scan_b[lane] = transform_b;
+    __syncthreads();
+    for (int offset = 1; offset < 1024; offset <<= 1) {
+        float previous_a = 1.0f;
+        float previous_b = 0.0f;
+        const float current_a = scan_a[lane];
+        const float current_b = scan_b[lane];
+        if (lane >= offset) {
+            previous_a = scan_a[lane - offset];
+            previous_b = scan_b[lane - offset];
+        }
+        __syncthreads();
+        if (lane >= offset) {
+            scan_a[lane] = current_a * previous_a;
+            scan_b[lane] = fmaf(current_a, previous_b, current_b);
+        }
+        __syncthreads();
+    }
+    state = initial_state;
+    if (lane > 0) {
+        state = fmaf(scan_a[lane - 1], initial_state, scan_b[lane - 1]);
+    }
+    for (int i = begin; i < end; ++i) {
+        const int source = n - 1 - i;
+        const float output = sos1_step(
+            filtered[source], b0, recurrence, feed_forward, &state
+        );
+        if (source >= cut && source < n - cut) {
+            packed[signal * usable + source - cut] = output;
+        }
+    }
+}
+
 extern "C" __global__ void mark_candidates(
     const float* demod,
     unsigned char* candidates,
@@ -148,12 +298,22 @@ extern "C" __global__ void repair_spikes(
     int blocks,
     float threshold
 ) {
-    const int block = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int block = (int)blockIdx.x;
     if (block >= blocks) return;
+    const int lane = (int)threadIdx.x;
     const int base = block * n;
-    float interior_max = -3.402823466e+38f;
-    for (int i = 20; i < n - 20; ++i) interior_max = fmaxf(interior_max, demod[base + i]);
-    if (interior_max <= threshold) return;
+    __shared__ float maxima[256];
+    float lane_max = -3.402823466e+38f;
+    for (int i = 20 + lane; i < n - 20; i += 256) {
+        lane_max = fmaxf(lane_max, demod[base + i]);
+    }
+    maxima[lane] = lane_max;
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lane < stride) maxima[lane] = fmaxf(maxima[lane], maxima[lane + stride]);
+        __syncthreads();
+    }
+    if (maxima[0] <= threshold || lane != 0) return;
     for (int i = 0; i < n; ++i) {
         if (!candidates[base + i]) continue;
         const int start = i > 8 ? i - 8 : 0;
@@ -201,11 +361,23 @@ extern "C" __global__ void burst_means(
     int blocks,
     float inv_n
 ) {
-    const int block = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int block = (int)blockIdx.x;
     if (block >= blocks) return;
+    const int lane = (int)threadIdx.x;
+    __shared__ float lane_sums[16];
     float sum = 0.0f;
-    for (int i = 0; i < n; ++i) sum += burst[block * n + i] * inv_n;
-    means[block] = sum / (float)n;
+    if (lane < 16) {
+        for (int i = lane; i < n; i += 16) {
+            sum += burst[block * n + i] * inv_n;
+        }
+        lane_sums[lane] = sum;
+    }
+    __syncthreads();
+    if (lane == 0) {
+        sum = lane_sums[0];
+        for (int i = 1; i < 16; ++i) sum += lane_sums[i];
+        means[block] = sum / (float)n;
+    }
 }
 
 extern "C" __global__ void pack_burst(
