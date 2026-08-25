@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 
 use anyhow::Result;
-use tape_decode::{Decoder, DecoderMetadata, DecoderSpec, LumaOutput, WriteableField, BLOCKSIZE};
+use tape_decode::{
+    DecodeBackend, Decoder, DecoderMetadata, DecoderSpec, LumaOutput, WriteableField, BLOCKSIZE,
+};
 
 use crate::reader::DecodeReader;
 use crate::writer::DecodeWriter;
@@ -28,7 +30,18 @@ pub fn decode_all(
     spec: Arc<DecoderSpec>,
     start_offset: u64,
 ) -> Result<()> {
-    let mut decoder = Decoder::new(Arc::clone(&spec), start_offset);
+    decode_all_with_backend(reader, writer, spec, start_offset, DecodeBackend::Cpu)
+}
+
+/// Serial decoding with an explicitly selected block backend.
+pub fn decode_all_with_backend(
+    reader: &mut DecodeReader,
+    writer: &mut DecodeWriter,
+    spec: Arc<DecoderSpec>,
+    start_offset: u64,
+    backend: DecodeBackend,
+) -> Result<()> {
+    let mut decoder = Decoder::new_with_backend(Arc::clone(&spec), start_offset, backend)?;
 
     // Feed the decoder one chunk at a time over a sliding window starting at
     // absolute sample `base` (0, since reading begins at the stream start). A

@@ -11,8 +11,8 @@ mod spec;
 mod vec_utils;
 
 pub use decode::{
-    Decoder, DecoderMetadata, DropOuts, FieldInfoEntry, LumaOutput, VitsMetrics, WriteableField,
-    BLOCKSIZE,
+    DecodeBackend, Decoder, DecoderMetadata, DropOuts, FieldInfoEntry, LumaOutput, VitsMetrics,
+    WriteableField, BLOCKSIZE,
 };
 pub use request::{
     BoostBpf, BoostRampFilter, ColorSystem, DecodeOptions, DecodeProfile, DecodeRequest,

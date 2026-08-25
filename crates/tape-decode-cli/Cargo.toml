@@ -3,6 +3,10 @@ name = "tape-decode-cli"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cuda = ["tape-decode/cuda"]
+
 [[bin]]
 name = "tape-decode"
 path = "src/main.rs"

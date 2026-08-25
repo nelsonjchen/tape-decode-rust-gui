@@ -9,7 +9,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context as _, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
-use crate::decode::{decode_all, decode_all_mt, uses_multithreading, MtParams};
+use crate::decode::{decode_all_mt, decode_all_with_backend, uses_multithreading, MtParams};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
 use crate::metadata::{MetadataContext, PcmAudioParameters, TbcMetadataFull, VideoParameters};
 use crate::os;
@@ -17,8 +17,8 @@ use crate::profiles::{flatten_profile, load_profile, load_profile_file, profile_
 use crate::reader::{open_source, DecodeReader, SampleFormat};
 use crate::writer::DecodeWriter;
 use tape_decode::{
-    DecodeRequest, DecoderSpec, DropOuts, FieldInfoEntry, FieldOrderAction, NotchFilter,
-    WowInterpolation,
+    DecodeBackend, DecodeRequest, DecoderSpec, DropOuts, FieldInfoEntry, FieldOrderAction,
+    NotchFilter, WowInterpolation,
 };
 
 const DEFAULT_THRESHOLD_P_DDD: f32 = 0.18;
@@ -30,6 +30,12 @@ enum CliFieldOrderAction {
     Duplicate,
     Drop,
     None,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Eq, PartialEq)]
+enum CliDecodeBackend {
+    Cpu,
+    Cuda,
 }
 
 impl From<CliFieldOrderAction> for FieldOrderAction {
@@ -144,6 +150,13 @@ struct DecodeArgs {
     /// Enable debug-level logging unless RUST_LOG supplies an explicit filter.
     #[arg(long)]
     debug: bool,
+
+    /// Block-demodulation backend. CUDA is experimental and opt-in.
+    #[arg(long, value_enum, ignore_case = true, default_value = "cpu")]
+    backend: CliDecodeBackend,
+    /// CUDA device ordinal; only meaningful with `--backend cuda`.
+    #[arg(long, default_value_t = 0)]
+    cuda_device: usize,
 
     /// Export raw f32 TBC luma.
     #[arg(long)]
@@ -365,6 +378,17 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         )
         .try_init();
 
+    let backend = match cli.backend {
+        CliDecodeBackend::Cpu => DecodeBackend::Cpu,
+        CliDecodeBackend::Cuda => DecodeBackend::Cuda {
+            device_ordinal: cli.cuda_device,
+        },
+    };
+    if cli.backend == CliDecodeBackend::Cuda {
+        validate_cuda_args(&cli)?;
+        ensure_cuda_backend_compiled()?;
+    }
+
     let profile = match (cli.profile.as_deref(), cli.profile_file.as_deref()) {
         (Some(name), None) => load_profile(name)?,
         (None, Some(path)) => load_profile_file(path)?,
@@ -491,7 +515,7 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
     // Both paths stream the input once from the start (so they work on non-seekable
     // inputs) and take `start_offset` directly.
     if !uses_multithreading(cli.mt_threads) {
-        decode_all(&mut reader, &mut writer, spec, start_offset)?;
+        decode_all_with_backend(&mut reader, &mut writer, spec, start_offset, backend)?;
     } else {
         let mt = MtParams {
             threads: cli.mt_threads,
@@ -503,6 +527,43 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
         decode_all_mt(reader, &mut writer, spec, mt, start_offset)?;
     }
     Ok(())
+}
+
+fn validate_cuda_args(cli: &DecodeArgs) -> Result<()> {
+    if cli.profile.as_deref() != Some("NTSC_VHS") || cli.profile_file.is_some() {
+        bail!("CUDA currently supports only the embedded --profile NTSC_VHS graph");
+    }
+    if uses_multithreading(cli.mt_threads) {
+        bail!("CUDA owns field batching and cannot be combined with --mt-threads >= 2");
+    }
+    let frequency = cli.frequency.unwrap_or(40.0);
+    if (frequency - 28.636363).abs() > 0.000001 {
+        bail!("CUDA NTSC VHS requires --frequency 28.636363M");
+    }
+    if cli.export_raw_tbc
+        || cli.chroma_trap
+        || cli.sharpness != 0
+        || cli.notch.is_some()
+        || cli.high_boost.is_some()
+        || cli.disable_diff_demod
+        || cli.fm_audio_notch.is_some()
+        || cli.nldeemp
+        || cli.subdeemp
+    {
+        bail!("CUDA v1 does not support options that modify the NTSC VHS block graph");
+    }
+    Ok(())
+}
+
+fn ensure_cuda_backend_compiled() -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        Ok(())
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        bail!("CUDA backend requested, but this build was compiled without the `cuda` feature")
+    }
 }
 
 fn run_write_profile(args: WriteProfileArgs) -> Result<()> {
@@ -1016,5 +1077,84 @@ fn report_json(candidate: &Path, total_errors: usize, errors: &[String], failed:
             eprintln!("  {error}");
         }
         *failed = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_decode(extra: &[&str]) -> DecodeArgs {
+        let mut argv = vec![
+            "tape-decode",
+            "decode",
+            "--profile",
+            "NTSC_VHS",
+            "--frequency",
+            "28.636363M",
+            "--luma-out",
+            "out.tbc",
+        ];
+        argv.extend_from_slice(extra);
+        argv.push("input.u8");
+        match Cli::try_parse_from(argv)
+            .expect("decode args should parse")
+            .command
+        {
+            Command::Decode(args) => args,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn cuda_accepts_standard_ntsc_vhs_graph() {
+        let args = parse_decode(&["--backend", "cuda"]);
+        assert!(validate_cuda_args(&args).is_ok());
+    }
+
+    #[test]
+    fn cuda_rejects_multithreaded_and_modified_graphs() {
+        let mt = parse_decode(&["--backend", "cuda", "--mt-threads", "2"]);
+        assert!(validate_cuda_args(&mt)
+            .unwrap_err()
+            .to_string()
+            .contains("field batching"));
+
+        let sharp = parse_decode(&["--backend", "cuda", "--sharpness", "10"]);
+        assert!(validate_cuda_args(&sharp)
+            .unwrap_err()
+            .to_string()
+            .contains("block graph"));
+
+        let mut wrong_frequency = parse_decode(&["--backend", "cuda"]);
+        wrong_frequency.frequency = Some(16.0);
+        assert!(validate_cuda_args(&wrong_frequency)
+            .unwrap_err()
+            .to_string()
+            .contains("28.636363M"));
+
+        let custom_profile = parse_decode(&["--backend", "cuda"]);
+        let mut custom_profile = custom_profile;
+        custom_profile.profile = None;
+        custom_profile.profile_file = Some(PathBuf::from("custom.json"));
+        assert!(validate_cuda_args(&custom_profile)
+            .unwrap_err()
+            .to_string()
+            .contains("embedded"));
+    }
+
+    #[test]
+    fn cpu_is_the_cli_default() {
+        let args = parse_decode(&[]);
+        assert_eq!(args.backend, CliDecodeBackend::Cpu);
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    #[test]
+    fn cuda_without_feature_is_rejected() {
+        assert!(ensure_cuda_backend_compiled()
+            .unwrap_err()
+            .to_string()
+            .contains("without the `cuda` feature"));
     }
 }

@@ -28,6 +28,32 @@ Cross-platform GUI package workflows are also available for:
 tape-decode --help
 ```
 
+### Experimental CUDA backend
+
+CUDA is opt-in; CPU remains the default and reference implementation. Build
+the CLI with CUDA support and request it explicitly:
+
+```bash
+cargo build --release --features cuda -p tape-decode-cli
+
+tape-decode decode \
+  --profile NTSC_VHS \
+  --frequency 28.636363M \
+  --backend cuda \
+  --cuda-device 0 \
+  --luma-out decoded.tbc \
+  --chroma-out decoded_chroma.tbc \
+  --metadata-out decoded.tbc.json \
+  capture.u8
+```
+
+The first implementation supports only the embedded `NTSC_VHS` graph at
+28,636,363 Hz. It rejects custom profiles, graph-changing options, unavailable
+devices, and `--mt-threads >= 2` without falling back to CPU. It dynamically
+loads CUDA/NVRTC/cuFFT and compiles a CUBIN for the selected device's compute
+capability on first use. See [the CUDA backend notes](docs/cuda-backend.md) for
+architecture, validation status, and limitations.
+
 ## Decode Launcher GUI (decode-rust-gui)
 
 The repository includes a Qt6 launcher (`decode.py` + `decode_launcher.py`) modeled after the vhs-decode Decode Launcher and wired to `tape-decode`.

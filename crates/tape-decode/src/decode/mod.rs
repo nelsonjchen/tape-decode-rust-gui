@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 
 // Submodules split out of the original monolithic decode.rs.
 mod chroma;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod demodblock;
 mod dropouts;
 mod field;
@@ -25,6 +27,8 @@ mod sync;
 mod vits;
 
 use chroma::decode_chroma;
+#[cfg(feature = "cuda")]
+use cuda::CudaBlockDecoder;
 use demodblock::decode_video_block;
 use dropouts::detect_dropouts_rf;
 use field::predecode_field_from_rawdecode;
@@ -593,6 +597,65 @@ pub(crate) const BLOCKCUT_END: usize = 1024;
 const DOD_MERGE_THRESHOLD: isize = 30;
 const DOD_MIN_LENGTH: isize = 10;
 const BADJ: f64 = -1.4;
+
+/// Block-demodulation backend. CPU remains the default and reference path.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DecodeBackend {
+    #[default]
+    Cpu,
+    /// CUDA device ordinal. Requesting this in a build without the `cuda`
+    /// feature returns an error; it never falls back silently.
+    Cuda { device_ordinal: usize },
+}
+
+enum BlockBackend {
+    Cpu,
+    #[cfg(feature = "cuda")]
+    Cuda(Box<CudaBlockDecoder>),
+}
+
+impl BlockBackend {
+    fn new(backend: DecodeBackend, spec: &Arc<DecoderSpec>) -> Result<Self> {
+        match backend {
+            DecodeBackend::Cpu => Ok(Self::Cpu),
+            DecodeBackend::Cuda { device_ordinal } => {
+                #[cfg(feature = "cuda")]
+                {
+                    Ok(Self::Cuda(Box::new(CudaBlockDecoder::new(
+                        device_ordinal,
+                        spec,
+                    )?)))
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    let _ = (device_ordinal, spec);
+                    bail!("CUDA backend requested, but this build was compiled without the `cuda` feature")
+                }
+            }
+        }
+    }
+
+    fn decode_blocks(
+        &mut self,
+        rawdata: &[f32],
+        blocks: usize,
+        spec: &DecoderSpec,
+        out: &mut VideoChannels,
+    ) -> Result<()> {
+        match self {
+            Self::Cpu => {
+                let usable = spec.usable_blocksize();
+                for block in 0..blocks {
+                    let start = block * usable;
+                    decode_video_block(&rawdata[start..start + BLOCKSIZE], spec, out)?;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "cuda")]
+            Self::Cuda(cuda) => cuda.decode_blocks(rawdata, blocks, spec, out),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub enum LumaOutput {
@@ -1216,6 +1279,7 @@ fn padded_burst_area(spec: &DecoderSpec) -> (isize, isize) {
 // input offset, and the speculative-predecode/field-ordering memory.
 pub struct Decoder {
     spec: Arc<DecoderSpec>,
+    block_backend: BlockBackend,
     fdoffset: u64,
     fdoffset_frac: f64,
     inter_field_state: InterFieldState,
@@ -1233,11 +1297,22 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(spec: Arc<DecoderSpec>, fdoffset: u64) -> Self {
+        Self::new_with_backend(spec, fdoffset, DecodeBackend::Cpu)
+            .expect("CPU decoder construction is infallible")
+    }
+
+    pub fn new_with_backend(
+        spec: Arc<DecoderSpec>,
+        fdoffset: u64,
+        backend: DecodeBackend,
+    ) -> Result<Self> {
         let inter_field_state = InterFieldState::new(spec.track_phase);
         let resync_state = ResyncState::new(&spec);
         let chroma_afc_state = ChromaAfcState::new(&spec);
-        Self {
+        let block_backend = BlockBackend::new(backend, &spec)?;
+        Ok(Self {
             spec,
+            block_backend,
             fdoffset,
             fdoffset_frac: 0.0,
             inter_field_state,
@@ -1251,7 +1326,7 @@ impl Decoder {
             pending_result: None,
             has_pending: false,
             duplicate_prev_field: true,
-        }
+        })
     }
 
     // Decode as many fields as the window `data` allows. `data` is a window of the
@@ -1340,16 +1415,18 @@ impl Decoder {
                     demod_burst: Vec::with_capacity(field_capacity),
                     envelope: Vec::with_capacity(field_capacity),
                 };
-                let mut completed_blocks = true;
-                for b in requested_begin..requested_end {
-                    // Only decode a full BLOCKSIZE window; a short tail at the true
-                    // end of input leaves the sequence incomplete and ends decoding.
-                    let start = b * usable_blocksize - data_start;
-                    let Some(rawdata) = data.get(start..start + BLOCKSIZE) else {
-                        completed_blocks = false;
-                        break;
-                    };
-                    decode_video_block(rawdata, &self.spec, &mut video)?;
+                let block_count = requested_end - requested_begin;
+                let first_start = requested_begin * usable_blocksize - data_start;
+                let batch_len = (block_count - 1) * usable_blocksize + BLOCKSIZE;
+                let batch = data.get(first_start..first_start + batch_len);
+                let completed_blocks = batch.is_some();
+                if let Some(rawdata) = batch {
+                    self.block_backend.decode_blocks(
+                        rawdata,
+                        block_count,
+                        &self.spec,
+                        &mut video,
+                    )?;
                 }
                 self.pending_result = if completed_blocks {
                     let rawdecode = FieldData {

@@ -3,8 +3,13 @@ name = "tape-decode"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
 [dependencies]
 anyhow = "1"
+cudarc = { version = "0.19.9", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "cufft", "dynamic-loading", "cuda-13030"] }
 num-traits = "0.2"
 realfft = "3"
 rustfft = "6"
