@@ -7,9 +7,10 @@ default and the quality oracle. A CUDA request fails rather than silently
 falling back when the feature, driver, device, format, profile, or option graph
 is unsupported.
 
-The implementation is usable end to end on an NVIDIA RTX 2080, but the initial
-bounded acceptance run does not yet satisfy the project's cross-backend MSRE or
-performance gates. Do not substitute CUDA output for a preservation decode.
+The implementation is usable end to end on an NVIDIA RTX 2080, but it is now
+mothballed: it did not satisfy the 1.5x performance gate, and a deeper GPU-sync
+experiment exposed a rare quality regression. Do not substitute CUDA output
+for a preservation decode.
 
 ## Design
 
@@ -179,3 +180,46 @@ Optimized artifacts are retained under
 `D:\VHS-Decode\tape-decode-cuda-dev\corpus-opt-v3-mt`,
 `D:\VHS-Decode\tape-decode-cuda-dev\quality-opt-v3-serial`, and
 `D:\VHS-Decode\tape-decode-cuda-dev\benchmark-opt-v3.json`.
+
+## Mothballed optimization state (2026-08-25)
+
+A final profiling pass found that CPU sync-level estimation dominated the
+remaining runtime. Moving its three zero-phase SOS filters to the existing GPU
+affine-scan implementation reduced one CUDA12 run to about 14.54 seconds, but
+the parallel scan's different floating-point association changed a rare
+serration minimum. On VHS-0005 field 948 this altered line geometry and raised
+trimmed luma MSRE to 761.033, despite matching field count, chroma, and metadata
+tolerance. A serial CUDA run reproduced the same field failure, ruling out the
+multi-worker stitcher. Running the CPU sync filters restored the field's CPU
+luma statistics and line geometry.
+
+Three additional experiments were evaluated:
+
+- cross-worker GPU field batching averaged only 1.5-1.9 fields per launch and
+  regressed wall time to 25-30 seconds;
+- CUDA Graph capture could not capture the cuFFT path (`CUFFT_EXEC_FAILED`);
+- field-wide GPU chroma analytic rotation increased contention and was slower,
+  so it was removed.
+
+The parked branch retains the useful low-risk work: independent worker streams,
+fused luma/delayed-luma/burst output spectra with one larger batched inverse
+cuFFT, reusable buffers/plans, GPU chroma final filtering, and selective CPU
+oracle replay of spike-sensitive overlap-save blocks. GPU sync filtering is
+disabled and the CPU reference remains authoritative for sync decisions.
+
+The clean three-run baseline immediately before the final experiments was
+16.592 seconds for CPU12 and 17.128 seconds for CUDA12 (0.969x), with peak VRAM
+2,951 MiB. A later single, non-accepted run with fused outputs and selective
+block replay reached 12.869 seconds, about 1.29x the CPU12 baseline, but still
+failed field 948 while GPU sync was enabled. It was neither a three-run median
+nor quality-valid, so it is not a performance claim. Telemetry during the deep
+GPU pass averaged 77.2% utilization, peaked at 95%, and stayed below 3,529 MiB
+VRAM; the RTX 2080 was active and clocked, but the workload remained dominated
+by FFT/memory/launch overhead and CPU downstream work rather than power limits.
+
+The experiment is stopped here. The 1.5x acceptance target was not achieved,
+no upstream pull request is planned, and the branch remains a research artifact
+on the fork. A final release-build check of the parked CPU-sync configuration
+decoded the 20-second VHS-0005 fixture in 14.933 seconds and passed the preserved
+CPU oracle for luma, chroma, and metadata at the documented acceptance
+tolerances. This is a single verification run, not a speed claim.

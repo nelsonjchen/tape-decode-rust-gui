@@ -846,7 +846,9 @@ impl DecoderSpec {
     }
 
     #[inline]
-    pub(crate) fn resync_field_ma_depth(&self) -> usize {
+    /// Number of fields retained by sync-level recovery. A speculative decoder
+    /// cannot be considered state-converged before this many agreeing fields.
+    pub fn resync_field_ma_depth(&self) -> usize {
         let fv = self.resync_fv();
         if fv < 60.0 {
             (fv / 5.0).round_ties_even() as usize

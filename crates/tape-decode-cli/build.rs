@@ -29,9 +29,7 @@ fn main() {
 
 fn git_output(args: &[&str]) -> String {
     match Command::new("git").args(args).output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => "UNKNOWN".to_string(),
     }
 }
@@ -72,10 +70,11 @@ fn git_release() -> String {
         }
     }
     // Fallback: dev-<short-sha>[-dirty], matching scripts/ci/git-version.sh.
-    let sha = match Command::new("git").args(["rev-parse", "--short", "HEAD"]).output() {
-        Ok(out) if out.status.success() => {
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        }
+    let sha = match Command::new("git")
+        .args(["rev-parse", "--short", "HEAD"])
+        .output()
+    {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_string(),
         _ => "nogit".to_string(),
     };
     let dirty = match Command::new("git")

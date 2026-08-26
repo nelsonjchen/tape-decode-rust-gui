@@ -126,6 +126,10 @@ fn field_phase_id(first_field: bool, second_phase: bool) -> i64 {
     }
 }
 
+fn translate_sequence(local: usize, offset: isize) -> usize {
+    local.saturating_add_signed(offset)
+}
+
 // --- Field comparison --------------------------------------------------------
 
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
@@ -543,6 +547,10 @@ struct MtOrchestrator<'a> {
     next_unassigned: u64,
     /// Fields committed to the output so far (the running global sequence count).
     committed: usize,
+    /// Per-worker translation from its decoder-local sequence domain into the
+    /// serial decoder's sequence domain. Unlike output position, sequence IDs
+    /// can repeat or skip when field-order recovery duplicates/drops a field.
+    seq_offsets: HashMap<u64, isize>,
     /// Decoder metadata to embed in the JSON sidecar while decoding runs, taken
     /// from the first worker to report it (it is the same for every worker). The
     /// final, authoritative metadata is written from `final_metadata` at close.
@@ -611,8 +619,9 @@ impl<'a> MtOrchestrator<'a> {
 
     /// Renumber a field's sequence-derived fields against the global position and
     /// write it out.
-    fn commit(&mut self, mut field: WriteableField) -> Result<()> {
-        let global_seq = self.committed + 1;
+    fn commit(&mut self, seg: u64, mut field: WriteableField) -> Result<()> {
+        let offset = self.seq_offsets.get(&seg).copied().unwrap_or_default();
+        let global_seq = translate_sequence(field.info.seq_no, offset);
         field.info.seq_no = global_seq;
         field.info.field_phase_id = field.field_phase_id_raw.unwrap_or_else(|| {
             field_phase_id(
@@ -641,12 +650,16 @@ impl<'a> MtOrchestrator<'a> {
     /// Advance `next`'s buffer to the field aligned with `file_loc` and report
     /// whether it matches `current_field`. The aligned field is consumed so the
     /// later decoder, if it takes over, resumes immediately after it.
-    fn compare_with_next(&mut self, next_seg: u64, current_field: &WriteableField) -> bool {
+    fn compare_with_next(
+        &mut self,
+        next_seg: u64,
+        current_field: &WriteableField,
+    ) -> Option<(bool, usize)> {
         let tol = self.spf / 2;
         let file_loc = current_field.info.file_loc;
         let aligned = {
             let Some(worker) = self.pool.get_mut(&next_seg) else {
-                return false;
+                return None;
             };
             // Drop any of `next`'s fields that fall before this one (extra fields
             // it produced while still locking on).
@@ -659,10 +672,13 @@ impl<'a> MtOrchestrator<'a> {
             match worker.peek() {
                 Some(g) if g.info.file_loc.abs_diff(file_loc) <= tol => worker.pop().unwrap(),
                 // `next` has no field at this location yet (or is finished).
-                _ => return false,
+                _ => return None,
             }
         };
-        fields_match(current_field, &aligned, &self.mt)
+        Some((
+            fields_match(current_field, &aligned, &self.mt),
+            aligned.info.seq_no,
+        ))
     }
 
     /// Run the decode, always tearing down workers before returning (even on
@@ -698,7 +714,7 @@ impl<'a> MtOrchestrator<'a> {
             // authority; drain it to end of input.
             if !self.pool.contains_key(&next_seg) {
                 while let Some(field) = self.pool.get_mut(&current_seg).unwrap().pop() {
-                    self.commit(field)?;
+                    self.commit(current_seg, field)?;
                 }
                 self.absorb_outcome(current_seg)?;
                 return Ok(());
@@ -720,7 +736,7 @@ impl<'a> MtOrchestrator<'a> {
                     break;
                 }
                 let field = self.pool.get_mut(&current_seg).unwrap().pop().unwrap();
-                self.commit(field)?;
+                self.commit(current_seg, field)?;
             }
 
             // Phase 2: in the overlap window, commit the current decoder's fields
@@ -728,6 +744,7 @@ impl<'a> MtOrchestrator<'a> {
             // consecutive fields match (stitch) or the window is exhausted.
             let mut run = 0usize;
             let mut stitched = false;
+            let mut stitch_seq_pair = None;
             loop {
                 let in_window = match self.pool.get_mut(&current_seg).unwrap().peek() {
                     Some(field) => field.info.file_loc < region_end,
@@ -740,8 +757,13 @@ impl<'a> MtOrchestrator<'a> {
                     break;
                 }
                 let field = self.pool.get_mut(&current_seg).unwrap().pop().unwrap();
-                let matched = self.compare_with_next(next_seg, &field);
-                self.commit(field)?;
+                let current_local_seq = field.info.seq_no;
+                let comparison = self.compare_with_next(next_seg, &field);
+                let matched = comparison.is_some_and(|(matched, _)| matched);
+                if let Some((true, next_local_seq)) = comparison {
+                    stitch_seq_pair = Some((current_local_seq, next_local_seq));
+                }
+                self.commit(current_seg, field)?;
                 if matched {
                     run += 1;
                     if run >= self.mt.overlap_count {
@@ -754,6 +776,18 @@ impl<'a> MtOrchestrator<'a> {
             }
 
             if stitched {
+                let (current_local_seq, next_local_seq) =
+                    stitch_seq_pair.expect("a stitched run has a final sequence pair");
+                let current_offset = self
+                    .seq_offsets
+                    .get(&current_seg)
+                    .copied()
+                    .unwrap_or_default();
+                let current_global_seq = translate_sequence(current_local_seq, current_offset);
+                self.seq_offsets.insert(
+                    next_seg,
+                    current_global_seq as isize - next_local_seq as isize,
+                );
                 // The next decoder, already past the matched fields, takes over.
                 // Shut down (join) the old decoder before advancing the drop
                 // point past it, so the tape never drops input it is still reading.
@@ -807,12 +841,28 @@ pub fn decode_all_mt_with_backend(
     mut reader: DecodeReader,
     writer: &mut DecodeWriter,
     spec: Arc<DecoderSpec>,
-    mt: MtParams,
+    mut mt: MtParams,
     start_offset: u64,
     backend: DecodeBackend,
 ) -> Result<()> {
     if !uses_multithreading(mt.threads) {
         return decode_all_with_backend(&mut reader, writer, spec, start_offset, backend);
+    }
+
+    // CUDA's block output is intentionally close rather than bit-identical to
+    // CPU, so picture similarity alone can produce a false-positive stitch
+    // while the later decoder's sync-level moving average is still warming.
+    // Require the full state-memory horizon before handing authority over.
+    if matches!(backend, DecodeBackend::Cuda { .. }) {
+        let required = spec.resync_field_ma_depth();
+        if mt.overlap_count < required {
+            tracing::info!(
+                requested = mt.overlap_count,
+                required,
+                "raised CUDA stitch overlap to the sync-state convergence horizon"
+            );
+            mt.overlap_count = required;
+        }
     }
 
     let tape = Arc::new(Tape::new(reader));
@@ -844,6 +894,7 @@ pub fn decode_all_mt_with_backend(
         pool: HashMap::new(),
         next_unassigned: 0,
         committed: 0,
+        seq_offsets: HashMap::from([(0, 0)]),
         metadata: None,
         final_metadata: None,
     };
@@ -852,12 +903,22 @@ pub fn decode_all_mt_with_backend(
 
 #[cfg(test)]
 mod tests {
-    use super::uses_multithreading;
+    use super::{translate_sequence, uses_multithreading};
 
     #[test]
     fn one_or_zero_workers_use_the_serial_path() {
         assert!(!uses_multithreading(0));
         assert!(!uses_multithreading(1));
         assert!(uses_multithreading(2));
+    }
+
+    #[test]
+    fn worker_sequence_translation_preserves_repeats_and_gaps() {
+        // A later worker's local 8 maps onto serial sequence 595. Subsequent
+        // duplicate/recovery IDs must retain the local repeat and gap pattern.
+        let offset = 595isize - 8;
+        let local = [8usize, 9, 8, 10, 12];
+        let translated = local.map(|seq| translate_sequence(seq, offset));
+        assert_eq!(translated, [595, 596, 595, 597, 599]);
     }
 }

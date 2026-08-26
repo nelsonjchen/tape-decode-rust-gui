@@ -1668,7 +1668,8 @@ fn resync_get_pulses(
     field: &mut DecodedField,
     check_levels: bool,
     resync_state: &mut ResyncState,
-) -> (Vec<i64>, Vec<i64>) {
+    block_backend: &mut BlockBackend,
+) -> Result<(Vec<i64>, Vec<i64>)> {
     let ctx = GpCtx {
         sp_ire0: spec.sys_ire0,
         sp_hz_ire: spec.sys_hz_ire,
@@ -1694,6 +1695,7 @@ fn resync_get_pulses(
         &mut field.data.video.demod,
         check_levels,
         color_system_405_or_819,
+        block_backend,
     )
 }
 
@@ -1703,8 +1705,10 @@ pub(crate) fn try_get_pulses(
     inter_field_state: &mut InterFieldState,
     check_levels: bool,
     resync_state: &mut ResyncState,
+    block_backend: &mut BlockBackend,
 ) -> Result<Option<PulseResult>> {
-    let (raw_starts, raw_lengths) = resync_get_pulses(spec, field, check_levels, resync_state);
+    let (raw_starts, raw_lengths) =
+        resync_get_pulses(spec, field, check_levels, resync_state, block_backend)?;
     if raw_starts.is_empty()
         && (inter_field_state.prev_first_hsync_loc == -1.0 || spec.rf_fallback_vsync)
     {
@@ -1796,13 +1800,16 @@ fn vsync_arbitrage(
 
     if where_allmin.len() > 1 {
         let mut valid_serrations = Vec::new();
+        // Both inputs are monotonically increasing. The direct nested search
+        // made every field's level estimator quadratic in the number of local
+        // minima and harmonic zero crossings. Binary bounds preserve its exact
+        // inclusive interval semantics (including duplicate matches at shared
+        // boundaries) while reducing the search to O(S log M).
         for (id, &edge) in serrations.iter().enumerate() {
-            for &s_min in where_allmin {
-                let next_serration_id = (id + 1).min(serrations.len() - 1);
-                if edge <= s_min && s_min <= serrations[next_serration_id] {
-                    valid_serrations.push(edge);
-                }
-            }
+            let next_edge = serrations[(id + 1).min(serrations.len() - 1)];
+            let first = where_allmin.partition_point(|&minimum| minimum < edge);
+            let end = where_allmin.partition_point(|&minimum| minimum <= next_edge);
+            valid_serrations.extend(std::iter::repeat(edge).take(end.saturating_sub(first)));
         }
 
         for serration in valid_serrations {
@@ -1822,6 +1829,70 @@ fn vsync_arbitrage(
     }
 
     result
+}
+
+#[cfg(test)]
+fn vsync_arbitrage_quadratic_reference(
+    vsynclen: i64,
+    where_allmin: &[i64],
+    serrations: &[i64],
+    datalen: i64,
+) -> Vec<i64> {
+    let mut result = Vec::new();
+    if where_allmin.len() > 1 {
+        let mut valid_serrations = Vec::new();
+        for (id, &edge) in serrations.iter().enumerate() {
+            for &minimum in where_allmin {
+                let next_id = (id + 1).min(serrations.len() - 1);
+                if edge <= minimum && minimum <= serrations[next_id] {
+                    valid_serrations.push(edge);
+                }
+            }
+        }
+        for serration in valid_serrations {
+            if serration - vsynclen >= 0 || serration + vsynclen < datalen {
+                result.push(serration);
+            }
+        }
+    } else if where_allmin.len() == 1 {
+        let only_min = where_allmin[0];
+        if only_min + vsynclen < datalen - 1 {
+            result.push(only_min);
+            result.push(only_min + vsynclen);
+        } else {
+            result.push(only_min);
+            result.push((only_min - vsynclen).max(0));
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod arbitrage_tests {
+    use super::{vsync_arbitrage, vsync_arbitrage_quadratic_reference};
+
+    #[test]
+    fn optimized_arbitrage_preserves_inclusive_boundary_matches() {
+        let minima = [0, 5, 10, 20, 21, 30, 40];
+        let serrations = [0, 10, 20, 30, 40];
+        assert_eq!(
+            vsync_arbitrage(7, &minima, &serrations, 64),
+            vsync_arbitrage_quadratic_reference(7, &minima, &serrations, 64)
+        );
+    }
+
+    #[test]
+    fn optimized_arbitrage_matches_reference_for_dense_sorted_inputs() {
+        let minima = (0..4096)
+            .filter(|value| value % 3 != 1)
+            .map(i64::from)
+            .collect::<Vec<_>>();
+        let serrations = (0..4096).step_by(5).map(i64::from).collect::<Vec<_>>();
+        assert_eq!(
+            vsync_arbitrage(120, &minima, &serrations, 5000),
+            vsync_arbitrage_quadratic_reference(120, &minima, &serrations, 5000)
+        );
+    }
 }
 
 fn vsyncserration_search_eq_pulses(
@@ -1998,14 +2069,37 @@ fn vsync_envelope_double(config: &DecoderSpec, data: &[f32]) -> (Vec<f32>, f32) 
 }
 
 // Measures the harmonics of the EQ pulses.
-fn vsync_power_ratio_search(config: &DecoderSpec, data: &[f32]) -> Vec<i64> {
-    let mut first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_base[0], data);
-    first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_base[1], &first_harmonic);
+fn vsync_power_ratio_search(
+    config: &DecoderSpec,
+    data: &[f32],
+    block_backend: &mut BlockBackend,
+) -> Result<Vec<i64>> {
+    let mut first_harmonic = data.to_vec();
+    if !block_backend.process_sync_filter(
+        &mut first_harmonic,
+        &config.resync_serration_filter_base[0],
+        0,
+    )? {
+        first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_base[0], &first_harmonic);
+    }
+    if !block_backend.process_sync_filter(
+        &mut first_harmonic,
+        &config.resync_serration_filter_base[1],
+        1,
+    )? {
+        first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_base[1], &first_harmonic);
+    }
     for v in &mut first_harmonic {
         *v *= *v;
     }
-    let env = sosfiltfilt_f32(&config.resync_serration_filter_envelope, &first_harmonic);
-    argrelmin(&env)
+    if !block_backend.process_sync_filter(
+        &mut first_harmonic,
+        &config.resync_serration_filter_envelope,
+        2,
+    )? {
+        first_harmonic = sosfiltfilt_f32(&config.resync_serration_filter_envelope, &first_harmonic);
+    }
+    Ok(argrelmin(&first_harmonic))
 }
 
 fn resync_pulses_blacklevel(
@@ -2193,20 +2287,47 @@ impl VsyncSerrationState {
     }
 
     // Searches candidate envelope minima in padded data.
-    fn vsync_envelope(&mut self, config: &DecoderSpec, data: &[f32], padding: usize) {
+    fn vsync_envelope(
+        &mut self,
+        config: &DecoderSpec,
+        data: &[f32],
+        padding: usize,
+        block_backend: &mut BlockBackend,
+    ) -> Result<()> {
+        let profile = std::env::var_os("TAPE_DECODE_PROFILE_DETAIL").is_some();
+        let total_started = profile.then(std::time::Instant::now);
+        let stage_started = profile.then(std::time::Instant::now);
         let p = padding.min(data.len());
         // Reflect-pad the front so the very-low-cutoff envelope filter has room
         // to settle before the real signal begins.
         let mut padded: Vec<f32> = data[..p].iter().rev().copied().collect();
         padded.extend_from_slice(data);
+        let pad_elapsed = stage_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let stage_started = profile.then(std::time::Instant::now);
         let (forward0, forward1) = vsync_envelope_double(config, &padded);
+        let envelope_elapsed = stage_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
         self.sync_level_bias = forward1;
         let start = padding.min(forward0.len());
         // argrelmin only compares neighbours, so subtracting the constant
         // sync_level_bias would not move any minima; run it on forward0 directly.
+        let stage_started = profile.then(std::time::Instant::now);
         let where_allmin = argrelmin(&forward0[start..]);
+        let minima_elapsed = stage_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+        let mut power_elapsed = std::time::Duration::ZERO;
+        let mut classify_elapsed = std::time::Duration::ZERO;
         if !where_allmin.is_empty() {
-            let serrations = vsync_power_ratio_search(config, &padded);
+            let stage_started = profile.then(std::time::Instant::now);
+            let serrations = vsync_power_ratio_search(config, &padded, block_backend)?;
+            power_elapsed = stage_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
+            let stage_started = profile.then(std::time::Instant::now);
             let where_min = vsync_arbitrage(
                 config.resync_vsynclen_downsampled() as i64,
                 &where_allmin,
@@ -2220,13 +2341,35 @@ impl VsyncSerrationState {
             } else {
                 tracing::warn!("Unexpected vsync arbitrage");
             }
+            classify_elapsed = stage_started
+                .map(|started| started.elapsed())
+                .unwrap_or_default();
         } else {
             tracing::warn!("Unexpected video envelope");
         }
+        if let Some(started) = total_started {
+            tracing::info!(
+                target: "tape_decode_profile",
+                total_ms = started.elapsed().as_secs_f64() * 1000.0,
+                pad_ms = pad_elapsed.as_secs_f64() * 1000.0,
+                envelope_ms = envelope_elapsed.as_secs_f64() * 1000.0,
+                minima_ms = minima_elapsed.as_secs_f64() * 1000.0,
+                power_ms = power_elapsed.as_secs_f64() * 1000.0,
+                classify_ms = classify_elapsed.as_secs_f64() * 1000.0,
+                minima = where_allmin.len(),
+                "serration detail"
+            );
+        }
+        Ok(())
     }
 
     // Runs one serration measurement pass.
-    fn work_impl(&mut self, config: &DecoderSpec, data: &[f32]) {
+    fn work_impl(
+        &mut self,
+        config: &DecoderSpec,
+        data: &[f32],
+        block_backend: &mut BlockBackend,
+    ) -> Result<()> {
         self.found_serration = false;
         // Decimate the sync buffer by the resync divisor for the level-detection
         // pass.
@@ -2235,7 +2378,7 @@ impl VsyncSerrationState {
             .step_by(config.resync_divisor)
             .copied()
             .collect();
-        self.vsync_envelope(config, &downsampled, 1024);
+        self.vsync_envelope(config, &downsampled, 1024, block_backend)?;
         if self.has_levels() && self.found_serration {
             tracing::debug!(
                 count = self.levels_sync.size(),
@@ -2245,6 +2388,7 @@ impl VsyncSerrationState {
             tracing::debug!("VBI EQ serration pulses search failed (using fallback logic)");
         }
         self.fieldcount += 1;
+        Ok(())
     }
 
     fn pull_levels(&mut self) -> (Option<f32>, Option<f32>) {
@@ -2563,12 +2707,27 @@ impl ResyncState {
         demod_data: &mut [f32],
         check_levels: bool,
         color_system_405_or_819: bool,
-    ) -> (Vec<i64>, Vec<i64>) {
+        block_backend: &mut BlockBackend,
+    ) -> Result<(Vec<i64>, Vec<i64>)> {
+        let profile = std::env::var_os("TAPE_DECODE_PROFILE_DETAIL").is_some();
+        let total_started = profile.then(std::time::Instant::now);
+        let levels_started = profile.then(std::time::Instant::now);
+        let mut serration_elapsed = std::time::Duration::ZERO;
+        let mut fallback_elapsed = std::time::Duration::ZERO;
         if check_levels || !self.field_state.has_levels() {
             if !color_system_405_or_819 {
-                self.vsync_serration.work_impl(config, sync_reference);
+                let started = profile.then(std::time::Instant::now);
+                self.vsync_serration
+                    .work_impl(config, sync_reference, block_backend)?;
+                if let Some(started) = started {
+                    serration_elapsed = started.elapsed();
+                }
             }
+            let started = profile.then(std::time::Instant::now);
             self.add_pulselevels_to_serration_measures(config, ctx, sync_reference);
+            if let Some(started) = started {
+                fallback_elapsed = started.elapsed();
+            }
         }
         let pulse_hz_max;
         if self.vsync_serration.has_levels() || self.field_state.has_levels() {
@@ -2642,7 +2801,9 @@ impl ResyncState {
                 }
             }
         }
+        let levels_elapsed = levels_started.map(|started| started.elapsed());
         self.last_pulse_threshold = pulse_hz_max;
+        let find_started = profile.then(std::time::Instant::now);
         let (starts, lengths) = findpulses_raw(
             sync_reference,
             pulse_hz_max,
@@ -2650,6 +2811,26 @@ impl ResyncState {
             config.resync_long_pulse_max(),
         );
 
-        (starts, lengths)
+        if let Some(started) = total_started {
+            let total = started.elapsed();
+            let levels = levels_elapsed.unwrap_or_default();
+            let find = find_started
+                .map(|find_started| find_started.elapsed())
+                .unwrap_or_default();
+            tracing::info!(
+                target: "tape_decode_profile",
+                total_ms = total.as_secs_f64() * 1000.0,
+                levels_ms = levels.as_secs_f64() * 1000.0,
+                serration_ms = serration_elapsed.as_secs_f64() * 1000.0,
+                fallback_ms = fallback_elapsed.as_secs_f64() * 1000.0,
+                find_ms = find.as_secs_f64() * 1000.0,
+                other_ms = total.saturating_sub(levels + find).as_secs_f64() * 1000.0,
+                check_levels,
+                pulses = starts.len(),
+                "sync detail"
+            );
+        }
+
+        Ok((starts, lengths))
     }
 }

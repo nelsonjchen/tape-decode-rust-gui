@@ -123,6 +123,12 @@ fn round_ties_even_to_isize(value: f32) -> isize {
     value.round_ties_even() as isize
 }
 
+fn median_slice_with_scratch(values: &[f32], scratch: &mut Vec<f32>) -> f32 {
+    scratch.clear();
+    scratch.extend_from_slice(values);
+    median_from_values(scratch)
+}
+
 fn refine_linelocs_hsync(
     spec: &DecoderSpec,
     initial_linelocs: &[f32],
@@ -144,6 +150,7 @@ fn refine_linelocs_hsync(
     let mut linelocs_refined = initial_linelocs.to_vec();
     let mut refined_from_right_lineloc = -1.0;
     let mut prev_porch_level = -1.0f32;
+    let mut median_scratch = Vec::with_capacity(one_usec * 2);
     let one_usec_samples = spec.freq as f32;
     let normal_hsync_samples = normal_hsync_length as f32;
 
@@ -183,17 +190,23 @@ fn refine_linelocs_hsync(
                 let porch_level = if prev_porch_level > 0.0 {
                     prev_porch_level
                 } else {
-                    mean_slice(signed_bounds_slice(
-                        demod_05,
-                        round_ties_even_to_isize(zc - one_usec_samples),
-                        round_ties_even_to_isize(zc - (one_usec_samples * 0.5)),
-                    )) as f32
+                    median_slice_with_scratch(
+                        signed_bounds_slice(
+                            demod_05,
+                            round_ties_even_to_isize(zc - one_usec_samples),
+                            round_ties_even_to_isize(zc - (one_usec_samples * 0.5)),
+                        ),
+                        &mut median_scratch,
+                    )
                 };
-                let sync_level = mean_slice(signed_bounds_slice(
-                    demod_05,
-                    round_ties_even_to_isize(zc + one_usec_samples),
-                    round_ties_even_to_isize(zc + (one_usec_samples * 2.5)),
-                )) as f32;
+                let sync_level = median_slice_with_scratch(
+                    signed_bounds_slice(
+                        demod_05,
+                        round_ties_even_to_isize(zc + one_usec_samples),
+                        round_ties_even_to_isize(zc + (one_usec_samples * 2.5)),
+                    ),
+                    &mut median_scratch,
+                );
 
                 let zc2 = calczc_do(demod_05, ll1, (porch_level + sync_level) / 2.0, 400, 0)?;
                 if !zc2.is_nan() && (zc2 - zc).abs() < (one_usec_samples / 2.0) {
@@ -224,19 +237,25 @@ fn refine_linelocs_hsync(
             );
 
             if !slice_empty_or_out_of_range(hsync_area, ire_n_65, ire_30) {
-                let porch_level = mean_slice(signed_bounds_slice(
-                    demod_05,
-                    round_ties_even_to_isize(zc_fr + normal_hsync_samples + one_usec_samples),
-                    round_ties_even_to_isize(
-                        zc_fr + normal_hsync_samples + (one_usec_samples * 2.0),
+                let porch_level = median_slice_with_scratch(
+                    signed_bounds_slice(
+                        demod_05,
+                        round_ties_even_to_isize(zc_fr + normal_hsync_samples + one_usec_samples),
+                        round_ties_even_to_isize(
+                            zc_fr + normal_hsync_samples + (one_usec_samples * 2.0),
+                        ),
                     ),
-                )) as f32;
+                    &mut median_scratch,
+                );
 
-                let sync_level = mean_slice(signed_bounds_slice(
-                    demod_05,
-                    round_ties_even_to_isize(zc_fr + one_usec_samples),
-                    round_ties_even_to_isize(zc_fr + (one_usec_samples * 2.5)),
-                )) as f32;
+                let sync_level = median_slice_with_scratch(
+                    signed_bounds_slice(
+                        demod_05,
+                        round_ties_even_to_isize(zc_fr + one_usec_samples),
+                        round_ties_even_to_isize(zc_fr + (one_usec_samples * 2.5)),
+                    ),
+                    &mut median_scratch,
+                );
 
                 let zc2 = calczc_do(
                     demod_05,
@@ -248,10 +267,8 @@ fn refine_linelocs_hsync(
 
                 if !zc2.is_nan() && (zc2 - right_cross).abs() < (one_usec_samples / 2.0) {
                     refined_from_right_lineloc =
-                        right_cross - normal_hsync_samples + (2.25 * (spec.freq as f32 / 40.0));
-                    if (refined_from_right_lineloc - linelocs_refined[i]).abs()
-                        < (one_usec_samples * 2.0)
-                    {
+                        zc2 - normal_hsync_samples + (2.25 * (spec.freq as f32 / 40.0));
+                    if (refined_from_right_lineloc - linelocs_refined[i]).abs() < one_usec_samples {
                         right_cross = zc2;
                         right_cross_refined = true;
                         prev_porch_level = porch_level;
@@ -730,7 +747,13 @@ pub(crate) fn predecode_field_from_rawdecode(
     scheduled_readloc: u64,
     resync_state: &mut ResyncState,
     chroma_afc_state: &ChromaAfcState,
+    block_backend: &mut BlockBackend,
 ) -> Result<DecodeFieldResult> {
+    let profile = std::env::var_os("TAPE_DECODE_PROFILE_DETAIL").is_some();
+    let total_started = profile.then(std::time::Instant::now);
+    let mut pulse_time = std::time::Duration::ZERO;
+    let mut refine_time = std::time::Duration::ZERO;
+    let mut burst_time = std::time::Duration::ZERO;
     // Build and classify the next DecodedField from coalesced block data. This is
     // the sync/line-location half of the speculative predecode step; output/TBC
     // conversion and metadata writing remain in the executable orchestrator.
@@ -781,26 +804,36 @@ pub(crate) fn predecode_field_from_rawdecode(
     let has_levels = resync_state.has_levels();
     let do_level_detect =
         !spec.rf_saved_levels || !has_levels || inter_field_state.compute_linelocs_issues;
+    let stage_started = profile.then(std::time::Instant::now);
     let mut res = try_get_pulses(
         &mut pending_field,
         spec,
         inter_field_state,
         do_level_detect,
         resync_state,
+        block_backend,
     )?;
+    if let Some(started) = stage_started {
+        pulse_time += started.elapsed();
+    }
     let needs_level_retry = match &res {
         None => true,
         Some(res) => res.line0loc.is_none() || pending_field.sync_confidence == 0,
     };
     if needs_level_retry && !do_level_detect {
         tracing::debug!("Search for pulses failed, re-checking levels");
+        let stage_started = profile.then(std::time::Instant::now);
         res = try_get_pulses(
             &mut pending_field,
             spec,
             inter_field_state,
             true,
             resync_state,
+            block_backend,
         )?;
+        if let Some(started) = stage_started {
+            pulse_time += started.elapsed();
+        }
     }
 
     inter_field_state.compute_linelocs_issues = true;
@@ -864,14 +897,19 @@ pub(crate) fn predecode_field_from_rawdecode(
                         None,
                         None,
                     ) as usize;
-                    refine_linelocs_hsync(
+                    let stage_started = profile.then(std::time::Instant::now);
+                    let refined = refine_linelocs_hsync(
                         spec,
                         &linelocs_vec,
                         &pending_field.data.video.demod_05,
                         &mut linebad_vec,
                         normal_hsync_length,
                         resync_state.last_pulse_threshold(),
-                    )?
+                    )?;
+                    if let Some(started) = stage_started {
+                        refine_time += started.elapsed();
+                    }
+                    refined
                 } else {
                     linelocs_vec.clone()
                 };
@@ -884,12 +922,16 @@ pub(crate) fn predecode_field_from_rawdecode(
                         Some(f64::from(0xD300 - 0x0100) / (100.0 - f64::from(spec.sys_vsync_ire)));
                     if pending_field.valid {
                         if spec.rf_write_chroma {
+                            let stage_started = profile.then(std::time::Instant::now);
                             apply_burst_lock(
                                 &mut pending_field,
                                 spec,
                                 inter_field_state,
                                 chroma_afc_state,
                             )?;
+                            if let Some(started) = stage_started {
+                                burst_time += started.elapsed();
+                            }
                         }
                         let is_first_field = pending_field.is_first_field.unwrap_or(false);
                         let linecount = match (spec.sys_frame_lines, is_first_field) {
@@ -912,12 +954,16 @@ pub(crate) fn predecode_field_from_rawdecode(
                         let mut refined_linelocs = linelocs2_vec.clone();
                         if spec.color_system != ColorSystem::Monochrome {
                             if spec.rf_write_chroma {
+                                let stage_started = profile.then(std::time::Instant::now);
                                 apply_burst_lock(
                                     &mut pending_field,
                                     spec,
                                     inter_field_state,
                                     chroma_afc_state,
                                 )?;
+                                if let Some(started) = stage_started {
+                                    burst_time += started.elapsed();
+                                }
                                 if !spec.rf_disable_burst_hsync
                                     && spec.color_system == ColorSystem::Ntsc
                                 {
@@ -1097,6 +1143,20 @@ pub(crate) fn predecode_field_from_rawdecode(
         .context("missing nextfieldoffset")?;
     if pending_field.valid {
         pending_offset -= scheduled_readloc as f64 - pending_field.data.startloc as f64;
+    }
+    if let Some(started) = total_started {
+        let total = started.elapsed();
+        tracing::info!(
+            target: "tape_decode_profile",
+            total_ms = total.as_secs_f64() * 1000.0,
+            pulses_ms = pulse_time.as_secs_f64() * 1000.0,
+            refine_ms = refine_time.as_secs_f64() * 1000.0,
+            burst_ms = burst_time.as_secs_f64() * 1000.0,
+            other_ms = total.saturating_sub(pulse_time + refine_time + burst_time).as_secs_f64()
+                * 1000.0,
+            valid = pending_field.valid,
+            "predecode detail"
+        );
     }
     Ok(DecodeFieldResult {
         field: pending_field,

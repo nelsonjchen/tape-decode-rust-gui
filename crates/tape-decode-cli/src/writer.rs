@@ -95,7 +95,12 @@ impl DecodeWriter {
             let field_end = self.json_field_end + chunk.len() as u64;
 
             json_file.seek(SeekFrom::Start(self.json_field_end))?;
-            append_tail(&mut chunk, metadata, self.field_count, &self.metadata_context)?;
+            append_tail(
+                &mut chunk,
+                metadata,
+                self.field_count,
+                &self.metadata_context,
+            )?;
             json_file.write_all(&chunk)?;
 
             self.json_field_end = field_end;
@@ -138,7 +143,12 @@ impl DecodeWriter {
             // metadata and truncate, so the file matches a one-shot serialization
             // exactly (the array was opened up front by `open`).
             let mut chunk = Vec::new();
-            append_tail(&mut chunk, metadata.as_ref(), field_count, &self.metadata_context)?;
+            append_tail(
+                &mut chunk,
+                metadata.as_ref(),
+                field_count,
+                &self.metadata_context,
+            )?;
             json_file.seek(SeekFrom::Start(self.json_field_end))?;
             json_file.write_all(&chunk)?;
             json_file.set_len(self.json_field_end + chunk.len() as u64)?;

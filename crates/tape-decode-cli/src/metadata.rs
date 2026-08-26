@@ -176,7 +176,10 @@ mod tests {
         assert_eq!(parse_profile_flags("MPAL_VHS"), ("MPAL", "VHS"));
         assert_eq!(parse_profile_flags("NLINHA_VHS"), ("NLINHA", "VHS"));
         // HIFI / HI are part of the format, not speed suffixes.
-        assert_eq!(parse_profile_flags("NTSC_BETAMAX_HIFI"), ("NTSC", "BETAMAX_HIFI"));
+        assert_eq!(
+            parse_profile_flags("NTSC_BETAMAX_HIFI"),
+            ("NTSC", "BETAMAX_HIFI")
+        );
         assert_eq!(parse_profile_flags("PAL_UMATIC_HI"), ("PAL", "UMATIC_HI"));
     }
 
@@ -213,9 +216,18 @@ mod tests {
         assert!(json.contains("\"gitCommit\":\""), "json: {json}");
         assert!(json.contains("\"gitRelease\":\""), "json: {json}");
         // Built inside a git checkout, so build.rs injected real (non-UNKNOWN) values.
-        assert_ne!(ctx.git_branch, "UNKNOWN", "git branch not injected by build.rs");
-        assert_ne!(ctx.git_commit, "UNKNOWN", "git commit not injected by build.rs");
-        assert_ne!(ctx.git_release, "UNKNOWN", "git release not injected by build.rs");
+        assert_ne!(
+            ctx.git_branch, "UNKNOWN",
+            "git branch not injected by build.rs"
+        );
+        assert_ne!(
+            ctx.git_commit, "UNKNOWN",
+            "git commit not injected by build.rs"
+        );
+        assert_ne!(
+            ctx.git_release, "UNKNOWN",
+            "git release not injected by build.rs"
+        );
         assert_ne!(ctx.git_release, "", "git release is empty");
     }
 }

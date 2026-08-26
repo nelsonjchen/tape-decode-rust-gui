@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::optimized::{
     exp_fast, narrow_sos, powf_fast_nonneg, scale_field, sosfilt_f32, sosfiltfilt_f32,
@@ -655,6 +656,38 @@ impl BlockBackend {
             Self::Cuda(cuda) => cuda.decode_blocks(rawdata, blocks, spec, out),
         }
     }
+
+    /// Run the final zero-phase chroma band-pass on the selected backend.
+    /// Returns `true` when the backend produced `chroma` in place; CPU callers
+    /// retain the reference implementation in `chroma.rs`.
+    fn process_chroma_spectrum(
+        &mut self,
+        _chroma: &mut [f32],
+        _spec: &DecoderSpec,
+        _allow_gpu: bool,
+    ) -> Result<bool> {
+        match self {
+            Self::Cpu => Ok(false),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(cuda) => cuda.process_chroma_spectrum(_chroma, _spec, _allow_gpu),
+        }
+    }
+
+    /// Apply one of the sync-level estimator's exact zero-phase SOS filters.
+    /// CPU keeps the reference implementation in `sync.rs`; CUDA reuses a
+    /// device workspace selected by the stable pipeline slot and signal length.
+    fn process_sync_filter(
+        &mut self,
+        _data: &mut [f32],
+        _filter: &[Sos<f32>],
+        _slot: u8,
+    ) -> Result<bool> {
+        // Mothballed: the parallel GPU SOS scan changed a rare serration
+        // minimum and pushed field 948 of VHS-0005 outside the luma oracle
+        // tolerance. Keep the call boundary for future work, but use the CPU
+        // reference filter for sync decisions.
+        Ok(false)
+    }
 }
 
 #[derive(Clone)]
@@ -893,6 +926,7 @@ struct VideoChannels {
     demod_05: Vec<f32>,
     demod_burst: Vec<f32>,
     envelope: Vec<f32>,
+    oracle_replayed: bool,
 }
 
 #[derive(Clone)]
@@ -1293,6 +1327,51 @@ pub struct Decoder {
     pending_result: Option<DecodeFieldResult>,
     has_pending: bool,
     duplicate_prev_field: bool,
+    profile: DecodeProfile,
+}
+
+#[derive(Default)]
+struct DecodeProfile {
+    enabled: bool,
+    start_offset: u64,
+    block: Duration,
+    predecode: Duration,
+    luma: Duration,
+    chroma: Duration,
+    metadata: Duration,
+    fields: usize,
+}
+
+impl DecodeProfile {
+    fn new(start_offset: u64) -> Self {
+        Self {
+            enabled: std::env::var_os("TAPE_DECODE_PROFILE").is_some(),
+            start_offset,
+            ..Self::default()
+        }
+    }
+
+    fn report(&self) {
+        if self.enabled {
+            tracing::info!(
+                target: "tape_decode_profile",
+                start_offset = self.start_offset,
+                fields = self.fields,
+                block_ms = self.block.as_secs_f64() * 1000.0,
+                predecode_ms = self.predecode.as_secs_f64() * 1000.0,
+                luma_ms = self.luma.as_secs_f64() * 1000.0,
+                chroma_ms = self.chroma.as_secs_f64() * 1000.0,
+                metadata_ms = self.metadata.as_secs_f64() * 1000.0,
+                "decoder stage profile"
+            );
+        }
+    }
+}
+
+impl Drop for Decoder {
+    fn drop(&mut self) {
+        self.profile.report();
+    }
 }
 
 impl Decoder {
@@ -1326,6 +1405,7 @@ impl Decoder {
             pending_result: None,
             has_pending: false,
             duplicate_prev_field: true,
+            profile: DecodeProfile::new(fdoffset),
         })
     }
 
@@ -1414,6 +1494,7 @@ impl Decoder {
                     demod_05: Vec::with_capacity(field_capacity),
                     demod_burst: Vec::with_capacity(field_capacity),
                     envelope: Vec::with_capacity(field_capacity),
+                    oracle_replayed: false,
                 };
                 let block_count = requested_end - requested_begin;
                 let first_start = requested_begin * usable_blocksize - data_start;
@@ -1421,12 +1502,16 @@ impl Decoder {
                 let batch = data.get(first_start..first_start + batch_len);
                 let completed_blocks = batch.is_some();
                 if let Some(rawdata) = batch {
+                    let started = self.profile.enabled.then(Instant::now);
                     self.block_backend.decode_blocks(
                         rawdata,
                         block_count,
                         &self.spec,
                         &mut video,
                     )?;
+                    if let Some(started) = started {
+                        self.profile.block += started.elapsed();
+                    }
                 }
                 self.pending_result = if completed_blocks {
                     let rawdecode = FieldData {
@@ -1434,7 +1519,8 @@ impl Decoder {
                         input_len: video.demod.len(),
                         video,
                     };
-                    Some(predecode_field_from_rawdecode(
+                    let started = self.profile.enabled.then(Instant::now);
+                    let pending = predecode_field_from_rawdecode(
                         rawdecode,
                         &self.spec,
                         scheduled_prevfield,
@@ -1442,7 +1528,12 @@ impl Decoder {
                         scheduled_readloc_value,
                         &mut self.resync_state,
                         &self.chroma_afc_state,
-                    )?)
+                        &mut self.block_backend,
+                    )?;
+                    if let Some(started) = started {
+                        self.profile.predecode += started.elapsed();
+                    }
+                    Some(pending)
                 } else {
                     None
                 };
@@ -1465,6 +1556,7 @@ impl Decoder {
                         // Drop it; the luma pass below recomputes with the final
                         // geometry and the chroma pass then reuses that.
                         field_obj.wow_analysis = None;
+                        let luma_started = self.profile.enabled.then(Instant::now);
                         let mut luma = downscale_raw_vec(
                             &mut field_obj,
                             None,
@@ -1497,17 +1589,25 @@ impl Decoder {
                                 field_obj.out_scale.unwrap(),
                             )));
                         }
+                        if let Some(started) = luma_started {
+                            self.profile.luma += started.elapsed();
+                        }
                         self.metadata_field = Some(MetadataFieldState {
                             out_scale: field_obj.out_scale.unwrap(),
                             outlinecount: field_obj.outlinecount,
                         });
 
+                        let chroma_started = self.profile.enabled.then(Instant::now);
                         picture_chroma = decode_chroma(
                             &mut field_obj,
                             &self.spec,
                             &mut self.chroma_afc_state,
                             &mut self.secam_state,
+                            &mut self.block_backend,
                         )?;
+                        if let Some(started) = chroma_started {
+                            self.profile.chroma += started.elapsed();
+                        }
 
                         field_obj.prevfield = None;
                         field_done = true;
@@ -1530,6 +1630,8 @@ impl Decoder {
             }
 
             if !self.fields.is_empty() || field_obj.is_first_field.unwrap_or(false) {
+                let metadata_started = self.profile.enabled.then(Instant::now);
+                let output_before = output.len();
                 let prevfi_1 = self.fields.last().cloned();
                 let prevfi_2 = self.fields.iter().rev().nth(1).cloned();
 
@@ -1672,6 +1774,10 @@ impl Decoder {
                         self.fields.push(dataset.info.clone());
                         output.push(dataset);
                     }
+                }
+                if let Some(started) = metadata_started {
+                    self.profile.metadata += started.elapsed();
+                    self.profile.fields += output.len() - output_before;
                 }
             }
         }

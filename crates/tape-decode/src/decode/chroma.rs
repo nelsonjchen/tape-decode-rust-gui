@@ -146,8 +146,13 @@ fn process_chroma_internal(
     spec: &DecoderSpec,
     chroma_afc_state: &mut ChromaAfcState,
     secam_state: &mut SecamState,
+    block_backend: &mut BlockBackend,
 ) -> Result<Vec<u16>> {
+    let profile = std::env::var_os("TAPE_DECODE_PROFILE_DETAIL").is_some();
+    let total_started = profile.then(std::time::Instant::now);
+    let stage_started = profile.then(std::time::Instant::now);
     let chroma_downscaled = downscale_raw_vec(field, None, None, None, true)?;
+    let downscale_time = stage_started.map_or(std::time::Duration::ZERO, |time| time.elapsed());
     let mut chroma: Vec<f32> = if spec.chroma_afc_enabled() {
         let bandpass = chroma_afc_state.get_chroma_bandpass(spec)?;
         let chroma_len = chroma_downscaled.len();
@@ -186,8 +191,15 @@ fn process_chroma_internal(
 
     let chroma_heterodyne = active_chroma_heterodyne(spec, chroma_afc_state);
 
+    let stage_started = profile.then(std::time::Instant::now);
     let mut uphet = upconvert_chroma(&chroma, field, chroma_heterodyne)?;
+    let upconvert_time = stage_started.map_or(std::time::Duration::ZERO, |time| time.elapsed());
 
+    let stage_started = profile.then(std::time::Instant::now);
+    // Keep analytic phase rotation on the CPU oracle. The expensive final
+    // zero-phase SOS filter runs on CUDA with the same odd extension, section
+    // order, steady-state seeds, and forward/reverse passes as the CPU path.
+    // Oracle-replayed collapse fields retain exact CPU `filtfilt` throughout.
     if is_ntsc && !spec.rf_disable_phase_correction {
         // Rotate the chroma so the measured burst phase lines up with 0 degrees.
         let burst_phase_avg = field.burst_phase_avg.context("missing burst phase avg")?;
@@ -198,27 +210,57 @@ fn process_chroma_internal(
         );
         adjust_phase(&hilbert, &mut uphet, burst_phase_avg, 0.0);
     }
+    let phase_time = stage_started.map_or(std::time::Duration::ZERO, |time| time.elapsed());
 
-    uphet = sosfiltfilt_f32(&spec.chroma_filter_final, &uphet);
+    let stage_started = profile.then(std::time::Instant::now);
+    let gpu_filter = block_backend.process_chroma_spectrum(
+        &mut uphet,
+        spec,
+        !field.data.video.oracle_replayed,
+    )?;
+    if !gpu_filter {
+        uphet = sosfiltfilt_f32(&spec.chroma_filter_final, &uphet);
+    }
 
     if let Some(sos) = spec.chroma_filter_deemphasis.as_ref() {
         uphet = sosfilt_f32(sos, &uphet);
     }
+    let filter_time = stage_started.map_or(std::time::Duration::ZERO, |time| time.elapsed());
 
+    let stage_started = profile.then(std::time::Instant::now);
     if !spec.rf_disable_comb {
         let line_distance = if is_ntsc { 1 } else { 2 };
         comb_c(&mut uphet, field.outlinelen, line_distance);
     }
+    let comb_time = stage_started.map_or(std::time::Duration::ZERO, |time| time.elapsed());
 
     let burst_abs_ref = spec.sys_burst_abs_ref.context("missing burst_abs_ref")?;
-    Ok(acc(
+    let stage_started = profile.then(std::time::Instant::now);
+    let output = acc(
         &uphet,
         burst_abs_ref,
         burstarea.0 as usize,
         burstarea.1 as usize,
         field.outlinelen,
         field.outlinecount,
-    ))
+    );
+    let acc_time = stage_started.map_or(std::time::Duration::ZERO, |time| time.elapsed());
+    if let Some(started) = total_started {
+        let total = started.elapsed();
+        tracing::info!(
+            target: "tape_decode_profile",
+            total_ms = total.as_secs_f64() * 1000.0,
+            downscale_ms = downscale_time.as_secs_f64() * 1000.0,
+            upconvert_ms = upconvert_time.as_secs_f64() * 1000.0,
+            phase_ms = phase_time.as_secs_f64() * 1000.0,
+            filter_ms = filter_time.as_secs_f64() * 1000.0,
+            comb_ms = comb_time.as_secs_f64() * 1000.0,
+            acc_ms = acc_time.as_secs_f64() * 1000.0,
+            readloc = field.readloc,
+            "chroma detail"
+        );
+    }
+    Ok(output)
 }
 
 pub(crate) fn decode_chroma(
@@ -226,10 +268,12 @@ pub(crate) fn decode_chroma(
     spec: &DecoderSpec,
     chroma_afc_state: &mut ChromaAfcState,
     secam_state: &mut SecamState,
+    block_backend: &mut BlockBackend,
 ) -> Result<Option<Vec<u16>>> {
     if !spec.rf_write_chroma || spec.color_system == ColorSystem::Monochrome {
         return Ok(None);
     }
-    let upconverted = process_chroma_internal(field, spec, chroma_afc_state, secam_state)?;
+    let upconverted =
+        process_chroma_internal(field, spec, chroma_afc_state, secam_state, block_backend)?;
     Ok(Some(upconverted))
 }
