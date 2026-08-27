@@ -4,6 +4,8 @@ use std::marker::PhantomData;
 
 use anyhow::{bail, Context as _, Result};
 use tracing::error;
+
+use crate::fidx::FlacIndex;
 use symphonia_core::io::{MediaSource, MediaSourceStream, ReadBytes};
 
 /// Input encoding. The raw formats widen straight to `f32` with no rescaling
@@ -168,15 +170,24 @@ pub trait SampleSource: Send {
 /// standard input, read forward-only (no real seek); anything else is a regular,
 /// seekable file. Raw formats stream bytes directly; `Flac` is decoded by
 /// [`crate::flac`].
-pub fn open_source(file: File, format: SampleFormat) -> Result<Box<dyn SampleSource>> {
-    let source: Box<dyn MediaSource> = Box::new(file);
+pub fn open_source(
+    file: File,
+    format: SampleFormat,
+    flac_index: Option<FlacIndex>,
+) -> Result<Box<dyn SampleSource>> {
+    if flac_index.is_some() && !matches!(format, SampleFormat::Flac) {
+        bail!("a .fidx sidecar can only be used with FLAC input");
+    }
     match format {
-        SampleFormat::U8 => raw::<U8Sample>(source),
-        SampleFormat::S8 => raw::<S8Sample>(source),
-        SampleFormat::S16LE => raw::<S16Sample>(source),
-        SampleFormat::U16LE => raw::<U16Sample>(source),
-        SampleFormat::F32LE => raw::<F32Sample>(source),
-        SampleFormat::Flac => crate::flac::open(source),
+        SampleFormat::U8 => raw::<U8Sample>(Box::new(file)),
+        SampleFormat::S8 => raw::<S8Sample>(Box::new(file)),
+        SampleFormat::S16LE => raw::<S16Sample>(Box::new(file)),
+        SampleFormat::U16LE => raw::<U16Sample>(Box::new(file)),
+        SampleFormat::F32LE => raw::<F32Sample>(Box::new(file)),
+        SampleFormat::Flac => match flac_index {
+            Some(index) => crate::flac::open_indexed(file, index),
+            None => crate::flac::open(Box::new(file)),
+        },
     }
 }
 
@@ -217,10 +228,6 @@ impl DecodeReader {
         if self.eof {
             return Ok(());
         }
-        if let Err(e) = self.source.seek_samples(sample) {
-            error!("{e:#}");
-            self.eof = true;
-        }
-        Ok(())
+        self.source.seek_samples(sample)
     }
 }

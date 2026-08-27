@@ -2,7 +2,7 @@
 //! parsed options into a `DecoderSpec` before running the decode.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, Read};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,6 +10,7 @@ use anyhow::{bail, Context as _, Result};
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use crate::decode::{decode_all, decode_all_mt, MtParams};
+use crate::fidx::{self, FlacIndex};
 use crate::fields_match::{f32_msre, wrapped_u16_msre};
 use crate::metadata::{MetadataContext, PcmAudioParameters, TbcMetadataFull, VideoParameters};
 use crate::os;
@@ -60,7 +61,7 @@ impl From<CliWowInterpolation> for WowInterpolation {
     }
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum CliSampleFormat {
     /// Unsigned 8-bit samples.
     U8,
@@ -109,6 +110,86 @@ enum Command {
     ListProfiles(ListProfilesArgs),
     /// Compare two decode outputs.
     Compare(CompareArgs),
+    /// Build or inspect a preservation-safe external FLAC frame index.
+    Fidx(FidxArgs),
+}
+
+#[derive(Args, Debug)]
+struct FidxArgs {
+    #[command(subcommand)]
+    command: FidxCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum FidxCommand {
+    /// Sequentially validate FLAC frames and write a binary `.fidx` sidecar.
+    Build(FidxBuildArgs),
+    /// Inspect a `.fidx` header and verify its record-array checksum.
+    Inspect(FidxInspectArgs),
+    /// Extract an exact CPU-decoded sample window through an indexed frame anchor.
+    Extract(FidxExtractArgs),
+}
+
+#[derive(Args, Debug)]
+struct FidxBuildArgs {
+    /// Native FLAC source. It is opened read-only and never rewritten.
+    source: PathBuf,
+    /// Sidecar path; defaults to SOURCE.fidx.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Retain every Nth validated frame. Use 1 for a dense index.
+    #[arg(long, default_value_t = 4096)]
+    stride: u32,
+    /// Replace an existing sidecar after the new index is complete.
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Args, Debug)]
+struct FidxInspectArgs {
+    /// Binary `.fidx` sidecar.
+    index: PathBuf,
+    /// Optional source FLAC to validate against the sidecar.
+    #[arg(long)]
+    source: Option<PathBuf>,
+    /// Hash the complete source and compare its SHA-256. Size is always checked.
+    #[arg(long, requires = "source")]
+    verify_source_hash: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum FidxOutputFormat {
+    /// Unsigned 8-bit PCM (bit-exact for an 8-bit FLAC source).
+    U8,
+    /// Little-endian normalized 32-bit float PCM.
+    F32LE,
+}
+
+#[derive(Args, Debug)]
+struct FidxExtractArgs {
+    /// Native FLAC source. It is opened read-only and never rewritten.
+    source: PathBuf,
+    /// Binary `.fidx` sidecar built from the source.
+    #[arg(long)]
+    index: PathBuf,
+    /// Absolute source sample at which extraction begins.
+    #[arg(long)]
+    sample_offset: u64,
+    /// Exact number of samples to write.
+    #[arg(long)]
+    sample_count: u64,
+    /// Raw PCM output path.
+    #[arg(long)]
+    out: PathBuf,
+    /// Output sample representation.
+    #[arg(long, value_enum, ignore_case = true, default_value = "u8")]
+    output_format: FidxOutputFormat,
+    /// Hash the complete source and compare its SHA-256 before extraction.
+    #[arg(long)]
+    verify_source_hash: bool,
+    /// Replace an existing derivative output.
+    #[arg(long)]
+    overwrite: bool,
 }
 
 #[derive(Args, Debug)]
@@ -138,6 +219,12 @@ struct DecodeArgs {
     /// Input format.
     #[arg(long, value_enum, ignore_case = true, default_value = "u8")]
     input_format: CliSampleFormat,
+    /// External `.fidx` sidecar for bounded FLAC frame seeking.
+    #[arg(long, requires = "offset")]
+    flac_index: Option<PathBuf>,
+    /// Hash the complete FLAC and verify it against `.fidx` before decoding.
+    #[arg(long, requires = "flac_index")]
+    verify_flac_index_hash: bool,
     /// Allow overwriting outputs.
     #[arg(long)]
     overwrite: bool,
@@ -352,7 +439,133 @@ pub fn run_cli() -> Result<()> {
         Command::WriteProfile(args) => run_write_profile(args),
         Command::ListProfiles(args) => run_list_profiles(args),
         Command::Compare(args) => run_compare(args),
+        Command::Fidx(args) => run_fidx(args),
     }
+}
+
+fn run_fidx(args: FidxArgs) -> Result<()> {
+    match args.command {
+        FidxCommand::Build(args) => {
+            let output = args
+                .out
+                .unwrap_or_else(|| append_fidx_extension(&args.source));
+            let summary = fidx::build(&args.source, &output, args.stride, args.overwrite)?;
+            serde_json::to_writer_pretty(io::stdout().lock(), &summary)?;
+            println!();
+        }
+        FidxCommand::Inspect(args) => {
+            let index = FlacIndex::read(&args.index)?;
+            if let Some(source_path) = args.source {
+                let source = File::open(&source_path).with_context(|| {
+                    format!("failed to open indexed source {}", source_path.display())
+                })?;
+                index.validate_source(&source, args.verify_source_hash)?;
+            }
+            serde_json::to_writer_pretty(io::stdout().lock(), &index.summary())?;
+            println!();
+        }
+        FidxCommand::Extract(args) => run_fidx_extract(args)?,
+    }
+    Ok(())
+}
+
+fn run_fidx_extract(args: FidxExtractArgs) -> Result<()> {
+    if args.sample_count == 0 {
+        bail!("--sample-count must be at least 1");
+    }
+    let end = args
+        .sample_offset
+        .checked_add(args.sample_count)
+        .context("sample range overflow")?;
+    let index = FlacIndex::read(&args.index)?;
+    if end > index.observed_total_samples() {
+        bail!(
+            "sample range {}..{} exceeds indexed stream length {}",
+            args.sample_offset,
+            end,
+            index.observed_total_samples()
+        );
+    }
+    let source = File::open(&args.source)
+        .with_context(|| format!("failed to open indexed source {}", args.source.display()))?;
+    index.validate_source(&source, args.verify_source_hash)?;
+    let mut samples = open_source(source, SampleFormat::Flac, Some(index))?;
+    samples.seek_samples(args.sample_offset)?;
+
+    if args.out.exists() && !args.overwrite {
+        bail!("output already exists: {}", args.out.display());
+    }
+    let mut temporary_name = args.out.as_os_str().to_owned();
+    temporary_name.push(format!(".partial-{}", std::process::id()));
+    let temporary_path = PathBuf::from(temporary_name);
+    let output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary_path)
+        .with_context(|| {
+            format!(
+                "failed to create temporary extraction output {}",
+                temporary_path.display()
+            )
+        })?;
+    let mut output = io::BufWriter::new(output);
+    let extraction = (|| -> Result<()> {
+        let mut buffer = vec![0.0f32; 1024 * 1024];
+        let mut remaining = args.sample_count;
+        while remaining != 0 {
+            let want = usize::try_from(remaining.min(buffer.len() as u64)).unwrap();
+            let read = samples.read(&mut buffer[..want])?;
+            if read == 0 {
+                bail!("FLAC ended with {remaining} requested samples remaining");
+            }
+            match args.output_format {
+                FidxOutputFormat::U8 => {
+                    let bytes: Vec<u8> = buffer[..read]
+                        .iter()
+                        .map(|sample| {
+                            (sample.mul_add(128.0, 128.0).round().clamp(0.0, 255.0)) as u8
+                        })
+                        .collect();
+                    output.write_all(&bytes)?;
+                }
+                FidxOutputFormat::F32LE => {
+                    for sample in &buffer[..read] {
+                        output.write_all(&sample.to_le_bytes())?;
+                    }
+                }
+            }
+            remaining -= read as u64;
+        }
+        output.flush()?;
+        output.get_ref().sync_all()?;
+        Ok(())
+    })();
+    drop(output);
+    if let Err(error) = extraction {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    if let Err(first_error) = std::fs::rename(&temporary_path, &args.out) {
+        if args.overwrite && args.out.exists() {
+            std::fs::remove_file(&args.out)?;
+            std::fs::rename(&temporary_path, &args.out)?;
+        } else {
+            return Err(first_error).with_context(|| {
+                format!(
+                    "failed to publish extraction {} to {}",
+                    temporary_path.display(),
+                    args.out.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_fidx_extension(source: &Path) -> PathBuf {
+    let mut name = source.as_os_str().to_owned();
+    name.push(".fidx");
+    PathBuf::from(name)
 }
 
 fn run_decode(cli: DecodeArgs) -> Result<()> {
@@ -442,6 +655,20 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
             .open(&cli.infile)
             .with_context(|| format!("failed to open input {}", cli.infile.display()))?
     };
+    let flac_index = match cli.flac_index.as_deref() {
+        Some(path) => {
+            if cli.input_format != CliSampleFormat::Flac {
+                bail!("--flac-index requires --input-format flac");
+            }
+            if cli.infile.as_os_str() == "-" {
+                bail!("--flac-index requires a regular source file");
+            }
+            let index = FlacIndex::read(path)?;
+            index.validate_source(&input_file, cli.verify_flac_index_hash)?;
+            Some(index)
+        }
+        None => None,
+    };
 
     let mut open_options = OpenOptions::new();
     if cli.overwrite {
@@ -483,12 +710,16 @@ fn run_decode(cli: DecodeArgs) -> Result<()> {
     };
 
     let spec = Arc::new(DecoderSpec::new(&request)?);
-    let mut reader = DecodeReader::new(open_source(input_file, cli.input_format.into())?);
+    let mut reader = DecodeReader::new(open_source(
+        input_file,
+        cli.input_format.into(),
+        flac_index,
+    )?);
     let metadata_context = MetadataContext::from_profile_name(cli.profile.as_deref());
     let mut writer = DecodeWriter::new(luma_out, chroma_out, metadata_out, metadata_context)?;
     let start_offset = cli.offset.unwrap_or(0);
-    // Both paths stream the input once from the start (so they work on non-seekable
-    // inputs) and take `start_offset` directly.
+    // Both paths take `start_offset` directly. Indexed FLAC starts at a sparse
+    // frame anchor; pipes and unindexed unknown-length FLACs skip sequentially.
     if cli.mt_threads == 0 {
         decode_all(&mut reader, &mut writer, spec, start_offset)?;
     } else {

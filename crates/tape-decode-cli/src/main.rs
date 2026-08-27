@@ -1,5 +1,6 @@
 mod cli;
 mod decode;
+mod fidx;
 mod fields_match;
 mod flac;
 mod metadata;

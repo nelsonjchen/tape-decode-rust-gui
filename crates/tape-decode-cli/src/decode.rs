@@ -23,16 +23,20 @@ pub fn decode_all(
 ) -> Result<()> {
     let mut decoder = Decoder::new(Arc::clone(&spec), start_offset);
 
+    // Start at the first sample the decoder can actually consume. Indexed FLAC
+    // input reopens at a nearby frame anchor; pipes and unindexed unknown-length
+    // FLACs reach the same point by sequentially discarding the prefix.
+    let initial_needed = first_needed_offset(&spec, start_offset)?;
+    reader.seek_samples(initial_needed)?;
+
     // Feed the decoder one chunk at a time over a sliding window starting at
-    // absolute sample `base` (0, since reading begins at the stream start). A
-    // chunk exceeds one field's span, so each refill makes progress. `decode`
-    // reports the offset before which input is no longer needed; we drop that
-    // prefix, or seek forward past it when `start_offset` lands beyond the window.
+    // absolute sample `base`. A chunk exceeds one field's span, so each refill
+    // makes progress.
     let chunk = spec.readlen() + 4 * BLOCKSIZE;
     let mut window: Vec<f32> = Vec::new();
     let mut read_buffer = vec![0.0f32; chunk];
-    let mut base: u64 = 0;
-    let mut read_pos: u64 = 0;
+    let mut base = initial_needed;
+    let mut read_pos = initial_needed;
 
     let mut fields_written = 0usize;
     loop {
@@ -199,17 +203,18 @@ struct BufState {
 }
 
 impl Tape {
-    fn new(source: DecodeReader) -> Self {
-        Self {
+    fn new(mut source: DecodeReader, start: u64) -> Result<Self> {
+        source.seek_samples(start)?;
+        Ok(Self {
             buf: RwLock::new(BufState {
                 buf: Vec::new(),
-                start: 0,
+                start,
                 eof: false,
                 len: None,
                 drop_threshold: 0,
             }),
             source: Mutex::new(source),
-        }
+        })
     }
 
     /// Total input length in samples, or `None` until the source hits EOF.
@@ -777,12 +782,12 @@ impl<'a> MtOrchestrator<'a> {
 
 /// Multithreaded counterpart to [`decode_all`]. Requires `mt.threads >= 1`;
 /// `mt.threads == 0` is handled by the serial path. `start_offset` is the
-/// absolute sample where decoding begins (`--start-fileloc`, 0 by default).
+/// absolute sample where decoding begins (`--offset`, 0 by default).
 ///
-/// The input is streamed once through a shared [`Tape`]; the workers never
-/// reopen, seek, or stat it, so this runs on non-seekable inputs such as pipes.
-/// The decoders themselves skip past the input before `start_offset`, so
-/// reading still begins at the stream's start.
+/// The source is positioned once at the first needed sample, then streamed once
+/// through a shared [`Tape`]; workers never reopen, seek, or stat it. Indexed
+/// FLAC can jump to a sparse anchor, while pipes skip to the same point by
+/// sequential reading.
 pub fn decode_all_mt(
     reader: DecodeReader,
     writer: &mut DecodeWriter,
@@ -790,7 +795,8 @@ pub fn decode_all_mt(
     mt: MtParams,
     start_offset: u64,
 ) -> Result<()> {
-    let tape = Arc::new(Tape::new(reader));
+    let initial_needed = first_needed_offset(&spec, start_offset)?;
+    let tape = Arc::new(Tape::new(reader, initial_needed)?);
     let spf = spec.samples_per_field();
     // A worker only needs to bank its own segment plus the handful of fields it
     // overlaps into the next segment to hand off (a one-field warm-up plus
@@ -822,4 +828,38 @@ pub fn decode_all_mt(
         final_metadata: None,
     };
     orchestrator.run()
+}
+
+#[cfg(test)]
+mod source_position_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    use crate::reader::SampleSource;
+
+    struct TrackingSource {
+        position: Arc<AtomicU64>,
+    }
+
+    impl SampleSource for TrackingSource {
+        fn read(&mut self, _out: &mut [f32]) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn seek_samples(&mut self, sample: u64) -> Result<()> {
+            self.position.store(sample, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn tape_positions_source_at_first_needed_sample() {
+        let position = Arc::new(AtomicU64::new(0));
+        let reader = DecodeReader::new(Box::new(TrackingSource {
+            position: Arc::clone(&position),
+        }));
+        let tape = Tape::new(reader, 123_456_789).unwrap();
+        assert_eq!(position.load(Ordering::Relaxed), 123_456_789);
+        assert_eq!(tape.buf.read().unwrap().start, 123_456_789);
+    }
 }
