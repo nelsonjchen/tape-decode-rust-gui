@@ -1863,10 +1863,11 @@ fn vsyncserration_search_eq_pulses(
     let eq_s = sync_pulses[where_min_diff[0]] as usize;
     let eq_e = ((sync_pulses[*where_min_diff.last().unwrap()] as f64) + (eq_pulselen as f64 / 2.0))
         as usize;
-    let eq_e = eq_e.min(data.len() - 1);
-    let data_s = eq_s + start;
-    let data_e = eq_e + start;
-    let serration = &data[data_s..data_e];
+    let Some(serration_range) = bounded_relative_range(start, eq_s, eq_e, data.len()) else {
+        return (false, None, None);
+    };
+    let data_s = serration_range.start;
+    let serration = &data[serration_range];
 
     if !(vbi_time_range_min < serration.len() as f64
         && (serration.len() as f64) < vbi_time_range_max)
@@ -1876,6 +1877,22 @@ fn vsyncserration_search_eq_pulses(
 
     let levels = get_serration_sync_levels(serration);
     (true, Some(data_s), Some(levels))
+}
+
+// Converts offsets measured inside a search window back into the parent slice.
+// A candidate at the right edge can legitimately extend one sample past the
+// available parent data, so clip its exclusive end and reject empty/overflowed
+// ranges instead of allowing a noisy VBI candidate to panic the decoder.
+fn bounded_relative_range(
+    parent_start: usize,
+    relative_start: usize,
+    relative_end: usize,
+    parent_len: usize,
+) -> Option<std::ops::Range<usize>> {
+    let absolute_start = parent_start.checked_add(relative_start)?;
+    let absolute_end = parent_start.checked_add(relative_end)?.min(parent_len);
+    (absolute_start < absolute_end && absolute_start < parent_len)
+        .then_some(absolute_start..absolute_end)
 }
 
 // Builds the vsync envelope (lowpass of the rectified signal, plus the
@@ -2651,5 +2668,25 @@ impl ResyncState {
         );
 
         (starts, lengths)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bounded_relative_range;
+
+    #[test]
+    fn relative_range_clips_exclusive_end_at_parent_boundary() {
+        assert_eq!(
+            bounded_relative_range(1, 240_000, 245_760, 245_760),
+            Some(240_001..245_760)
+        );
+    }
+
+    #[test]
+    fn relative_range_rejects_empty_or_outside_candidates() {
+        assert_eq!(bounded_relative_range(10, 20, 20, 100), None);
+        assert_eq!(bounded_relative_range(100, 0, 1, 100), None);
+        assert_eq!(bounded_relative_range(usize::MAX, 1, 2, 100), None);
     }
 }
