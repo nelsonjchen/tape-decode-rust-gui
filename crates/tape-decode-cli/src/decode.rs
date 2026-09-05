@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -342,6 +342,7 @@ fn decode_segment(
     start_needed: u64,
     tx: &SyncSender<WorkerMsg>,
     stop: &AtomicBool,
+    needed: &AtomicU64,
 ) -> Result<Option<DecoderMetadata>> {
     let mut decoder = Decoder::new(Arc::clone(spec), start_offset);
     let chunk = spec.readlen() + 4 * BLOCKSIZE;
@@ -361,6 +362,10 @@ fn decode_segment(
         window.extend_from_slice(&read_buffer[..read]);
 
         let (consumed, fields) = decoder.decode(&window, base, final_chunk)?;
+        // `consumed` is the earliest sample this decoder may still need. Publish
+        // it before sending fields: the output fields may block on the bounded
+        // channel, but the decoder has already released this input prefix.
+        needed.store(consumed, Ordering::Release);
         if !meta_sent {
             if let Some(metadata) = decoder.metadata() {
                 if tx.send(WorkerMsg::Meta(metadata)).is_err() {
@@ -399,6 +404,10 @@ fn decode_segment(
 struct Worker {
     rx: Receiver<WorkerMsg>,
     stop: Arc<AtomicBool>,
+    /// Earliest input sample this decoder may still need. Updated after every
+    /// decode call so the shared tape can release consumed prefixes even when
+    /// stitching remains stuck in a damaged interval.
+    needed: Arc<AtomicU64>,
     handle: Option<JoinHandle<()>>,
     buf: VecDeque<WriteableField>,
     finished: bool,
@@ -422,12 +431,21 @@ impl Worker {
     ) -> Self {
         let (tx, rx) = sync_channel(capacity);
         let stop = Arc::new(AtomicBool::new(false));
+        let needed = Arc::new(AtomicU64::new(start_needed));
         let spec = Arc::clone(spec);
         let tape = Arc::clone(tape);
         let worker_stop = Arc::clone(&stop);
+        let worker_needed = Arc::clone(&needed);
         let handle = thread::spawn(move || {
-            let outcome =
-                decode_segment(&spec, &tape, start_offset, start_needed, &tx, &worker_stop);
+            let outcome = decode_segment(
+                &spec,
+                &tape,
+                start_offset,
+                start_needed,
+                &tx,
+                &worker_stop,
+                &worker_needed,
+            );
             // If we were stopped, the receiver is gone and the result is moot.
             if !worker_stop.load(Ordering::Relaxed) {
                 let _ = tx.send(WorkerMsg::Done(outcome));
@@ -436,6 +454,7 @@ impl Worker {
         Self {
             rx,
             stop,
+            needed,
             handle: Some(handle),
             buf: VecDeque::new(),
             finished: false,
@@ -585,6 +604,22 @@ impl<'a> MtOrchestrator<'a> {
         }
     }
 
+    /// Release input that every live decoder has already consumed. This is
+    /// separate from segment stitching: a damaged interval may keep one
+    /// decoder authoritative while its successor is repeatedly discarded, but
+    /// the authoritative decoder still advances through the input and its old
+    /// prefix must not remain resident for the rest of the file.
+    fn refresh_drop_threshold(&self) {
+        if let Some(offset) = self
+            .pool
+            .values()
+            .map(|worker| worker.needed.load(Ordering::Acquire))
+            .min()
+        {
+            self.tape.set_drop_threshold(offset);
+        }
+    }
+
     /// Take a finished worker's outcome: surface a decode error, or capture the
     /// metadata of the decoder that reached this part of the file.
     fn absorb_outcome(&mut self, seg: u64) -> Result<()> {
@@ -617,6 +652,7 @@ impl<'a> MtOrchestrator<'a> {
         self.writer
             .write_writeable(&field, self.metadata.as_ref())?;
         self.committed += 1;
+        self.refresh_drop_threshold();
         Ok(())
     }
 
@@ -764,6 +800,7 @@ impl<'a> MtOrchestrator<'a> {
                     );
                 }
                 next_seg += 1;
+                self.refresh_drop_threshold();
             }
             self.refill()?;
         }
@@ -861,5 +898,33 @@ mod source_position_tests {
         let tape = Tape::new(reader, 123_456_789).unwrap();
         assert_eq!(position.load(Ordering::Relaxed), 123_456_789);
         assert_eq!(tape.buf.read().unwrap().start, 123_456_789);
+    }
+
+    #[test]
+    fn tape_releases_prefix_as_worker_progress_advances() {
+        let position = Arc::new(AtomicU64::new(0));
+        let reader = DecodeReader::new(Box::new(TrackingSource {
+            position: Arc::clone(&position),
+        }));
+        let tape = Tape::new(reader, 100).unwrap();
+        {
+            let mut state = tape.buf.write().unwrap();
+            state.buf.extend((0..100).map(|sample| sample as f32));
+        }
+
+        // This models a worker publishing Decoder::decode's `consumed` value.
+        let worker_needed = AtomicU64::new(140);
+        tape.set_drop_threshold(worker_needed.load(Ordering::Acquire));
+        {
+            let state = tape.buf.read().unwrap();
+            assert_eq!(state.start, 140);
+            assert_eq!(state.buf.len(), 60);
+        }
+
+        worker_needed.store(175, Ordering::Release);
+        tape.set_drop_threshold(worker_needed.load(Ordering::Acquire));
+        let state = tape.buf.read().unwrap();
+        assert_eq!(state.start, 175);
+        assert_eq!(state.buf.len(), 25);
     }
 }
