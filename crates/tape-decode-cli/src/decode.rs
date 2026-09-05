@@ -189,6 +189,22 @@ struct Tape {
     source: Mutex<DecodeReader>,
 }
 
+/// Drop the prefix that every live decoder has already consumed. Keeping this
+/// as a small free function makes the retention rule independently testable:
+/// stitching may fail, but input reclamation still follows the slowest worker.
+fn refresh_tape_drop_threshold<'a, I>(tape: &Tape, needed: I)
+where
+    I: IntoIterator<Item = &'a AtomicU64>,
+{
+    if let Some(offset) = needed
+        .into_iter()
+        .map(|frontier| frontier.load(Ordering::Acquire))
+        .min()
+    {
+        tape.set_drop_threshold(offset);
+    }
+}
+
 struct BufState {
     /// Buffered input samples (widened to `f32`) covering `[start, start + buf.len())`.
     buf: Vec<f32>,
@@ -610,14 +626,10 @@ impl<'a> MtOrchestrator<'a> {
     /// the authoritative decoder still advances through the input and its old
     /// prefix must not remain resident for the rest of the file.
     fn refresh_drop_threshold(&self) {
-        if let Some(offset) = self
-            .pool
-            .values()
-            .map(|worker| worker.needed.load(Ordering::Acquire))
-            .min()
-        {
-            self.tape.set_drop_threshold(offset);
-        }
+        refresh_tape_drop_threshold(
+            &self.tape,
+            self.pool.values().map(|worker| worker.needed.as_ref()),
+        );
     }
 
     /// Take a finished worker's outcome: surface a decode error, or capture the
@@ -878,6 +890,64 @@ mod source_position_tests {
         position: Arc<AtomicU64>,
     }
 
+    /// Small deterministic RF-shaped source for retention tests. It has a
+    /// repeating line sync/carrier pattern and a damaged run of equalizing
+    /// pulses, but it is deliberately not a complete broadcast signal: the
+    /// fixture exercises tape retention and worker lifetime, not RF lock.
+    struct ProceduralRfSource {
+        samples: Vec<f32>,
+        position: usize,
+    }
+
+    impl SampleSource for ProceduralRfSource {
+        fn read(&mut self, out: &mut [f32]) -> Result<usize> {
+            let available = self.samples.len().saturating_sub(self.position);
+            let count = available.min(out.len());
+            out[..count].copy_from_slice(&self.samples[self.position..self.position + count]);
+            self.position += count;
+            Ok(count)
+        }
+
+        fn seek_samples(&mut self, sample: u64) -> Result<()> {
+            self.position = (sample as usize).min(self.samples.len());
+            Ok(())
+        }
+    }
+
+    fn procedural_rf_fixture(sample_count: usize) -> Vec<f32> {
+        const SAMPLES_PER_LINE: usize = 64;
+        const DAMAGE_START_LINE: usize = 120;
+        const DAMAGE_END_LINE: usize = 128;
+
+        (0..sample_count)
+            .map(|sample| {
+                let line = sample / SAMPLES_PER_LINE;
+                let line_phase = sample % SAMPLES_PER_LINE;
+                let carrier = ((sample as f32) * std::f32::consts::TAU / 8.0).sin();
+                let mut value = 0.04 * carrier
+                    + match line_phase {
+                        0..=7 => -0.85,
+                        8..=11 => 0.25,
+                        _ => 0.10,
+                    };
+                // Mutate a short equalizing-pulse run to represent the
+                // damaged overlap where successor fields stop agreeing.
+                if (DAMAGE_START_LINE..DAMAGE_END_LINE).contains(&line) && line_phase < 16 {
+                    value = -value;
+                }
+                value.clamp(-1.0, 1.0)
+            })
+            .collect()
+    }
+
+    fn procedural_field_digest(samples: &[f32], start: usize, len: usize) -> u64 {
+        samples[start..start + len]
+            .iter()
+            .fold(0xcbf29ce484222325, |hash, sample| {
+                (hash ^ u64::from(sample.to_bits())).wrapping_mul(0x100000001b3)
+            })
+    }
+
     impl SampleSource for TrackingSource {
         fn read(&mut self, _out: &mut [f32]) -> Result<usize> {
             Ok(0)
@@ -926,5 +996,80 @@ mod source_position_tests {
         let state = tape.buf.read().unwrap();
         assert_eq!(state.start, 175);
         assert_eq!(state.buf.len(), 25);
+    }
+
+    #[test]
+    fn procedural_rf_failed_stitches_keep_tape_bounded() {
+        const SEGMENT_SAMPLES: u64 = 512;
+        const OVERLAP_SAMPLES: u64 = 96;
+        const SEGMENTS: u64 = 24;
+
+        let fixture_len = ((SEGMENTS + 1) * SEGMENT_SAMPLES + OVERLAP_SAMPLES) as usize;
+        let fixture = procedural_rf_fixture(fixture_len);
+        let reader = DecodeReader::new(Box::new(ProceduralRfSource {
+            samples: fixture.clone(),
+            position: 0,
+        }));
+        let tape = Arc::new(Tape::new(reader, 0).unwrap());
+        let stop = AtomicBool::new(false);
+        let authoritative_needed = AtomicU64::new(0);
+        let mut max_resident = 0usize;
+        let mut stale_resident = 0usize;
+        let mut mt_output = Vec::with_capacity(SEGMENTS as usize);
+
+        for segment in 0..SEGMENTS {
+            let overlap_end = (segment + 1) * SEGMENT_SAMPLES + OVERLAP_SAMPLES;
+            // The authoritative worker keeps consuming while the successor is
+            // decoded ahead. Each successor is then discarded: this models a
+            // failed overlap stitch without depending on fragile RF lock odds.
+            loop {
+                let frontier = {
+                    let state = tape.buf.read().unwrap();
+                    state.start + state.buf.len() as u64
+                };
+                if frontier >= overlap_end {
+                    break;
+                }
+                let mut read_buffer = [0.0f32; 256];
+                let (read, eof) = tape
+                    .read_into(frontier, &mut read_buffer, &stop)
+                    .unwrap()
+                    .unwrap();
+                assert!(read > 0, "procedural source ended before overlap window");
+                assert!(!eof);
+            }
+
+            let consumed = (segment + 1) * SEGMENT_SAMPLES;
+            authoritative_needed.store(consumed, Ordering::Release);
+            let successor_needed = AtomicU64::new(overlap_end);
+            refresh_tape_drop_threshold(&tape, [&authoritative_needed, &successor_needed]);
+
+            let resident = tape.buf.read().unwrap().buf.len();
+            max_resident = max_resident.max(resident);
+            // Without refresh_drop_threshold, the old drop point would have
+            // stayed at zero and the resident prefix would grow with input.
+            stale_resident = stale_resident.max(overlap_end as usize);
+
+            let start = (segment * SEGMENT_SAMPLES) as usize;
+            mt_output.push(procedural_field_digest(
+                &fixture,
+                start,
+                SEGMENT_SAMPLES as usize,
+            ));
+        }
+
+        let serial_output: Vec<_> = (0..SEGMENTS)
+            .map(|segment| {
+                procedural_field_digest(
+                    &fixture,
+                    (segment * SEGMENT_SAMPLES) as usize,
+                    SEGMENT_SAMPLES as usize,
+                )
+            })
+            .collect();
+
+        assert_eq!(mt_output, serial_output);
+        assert!(max_resident <= (SEGMENT_SAMPLES + OVERLAP_SAMPLES + 256) as usize);
+        assert!(stale_resident > max_resident * 10);
     }
 }
