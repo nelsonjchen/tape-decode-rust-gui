@@ -674,6 +674,22 @@ impl<'a> MtOrchestrator<'a> {
         }
     }
 
+    /// Stop every speculative successor while keeping the current authority
+    /// alive. This is used when repeated stitch failures show that the input is
+    /// in a damaged interval: retaining or replacing all of the speculative
+    /// workers only repeats work that cannot be committed.
+    fn shutdown_speculative_successors(&mut self, current_seg: u64) {
+        let successors: Vec<u64> = self
+            .pool
+            .keys()
+            .copied()
+            .filter(|&seg| seg > current_seg)
+            .collect();
+        for seg in successors {
+            self.shutdown_worker(seg);
+        }
+    }
+
     /// Advance `next`'s buffer to the field aligned with `file_loc` and report
     /// whether it matches `current_field`. The aligned field is consumed so the
     /// later decoder, if it takes over, resumes immediately after it.
@@ -723,6 +739,9 @@ impl<'a> MtOrchestrator<'a> {
             return Ok(());
         }
         let mut next_seg = 1u64;
+        let mut consecutive_stitch_failures = 0usize;
+        const BACKOFF_AFTER_FAILURES: usize = 3;
+        const MAX_BACKOFF_SEGMENTS: u64 = 32;
         // The lowest live segment fixes how far the tape may drop its prefix.
         self.mark_drop_to(current_seg);
 
@@ -796,6 +815,7 @@ impl<'a> MtOrchestrator<'a> {
                 self.shutdown_worker(current_seg);
                 current_seg = next_seg;
                 next_seg += 1;
+                consecutive_stitch_failures = 0;
                 self.mark_drop_to(current_seg);
             } else {
                 // The whole overlap disagreed: the earlier decoder stays
@@ -804,14 +824,39 @@ impl<'a> MtOrchestrator<'a> {
                 let start = self.seg_start(next_seg);
                 self.shutdown_worker(next_seg);
                 if produced {
+                    consecutive_stitch_failures = consecutive_stitch_failures.saturating_add(1);
                     tracing::warn!(
                         segment_start_sample = start,
                         "Discarded a thread's work: no {}-field match found within {} overlapping fields; the earlier thread remains authoritative",
                         self.mt.overlap_count,
                         self.mt.distance_size,
                     );
+                } else {
+                    consecutive_stitch_failures = 0;
                 }
-                next_seg += 1;
+
+                let ordinary_next = next_seg.saturating_add(1);
+                let recovery_next = if consecutive_stitch_failures >= BACKOFF_AFTER_FAILURES {
+                    let exponent =
+                        (consecutive_stitch_failures - BACKOFF_AFTER_FAILURES + 2).min(5);
+                    let skip = (1_u64 << exponent).min(MAX_BACKOFF_SEGMENTS);
+                    ordinary_next.saturating_add(skip.saturating_sub(1))
+                } else {
+                    ordinary_next
+                };
+                if recovery_next > ordinary_next {
+                    self.shutdown_speculative_successors(current_seg);
+                    self.next_unassigned = recovery_next;
+                    next_seg = recovery_next;
+                    tracing::warn!(
+                        from_segment = ordinary_next,
+                        to_segment = recovery_next,
+                        consecutive_failures = consecutive_stitch_failures,
+                        "Backing off speculative multithread workers after repeated stitch failures"
+                    );
+                } else {
+                    next_seg = ordinary_next;
+                }
                 self.refresh_drop_threshold();
             }
             self.refill()?;
